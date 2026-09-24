@@ -1,8 +1,8 @@
 from markdown_to_slack_blocks import (
-    clear_tag_handlers,
+    clear_xml_tag_handlers,
     container_block,
     markdown_to_blocks,
-    register_tag_handler,
+    register_xml_tag_handler,
 )
 
 
@@ -26,6 +26,9 @@ def _detailed(tag):
     )
 
 
+HANDLERS = {"xml_tag_handlers": {"sources": _sources, "detailed": _detailed}}
+
+
 def test_without_handlers_tags_stay_text():
     blocks = markdown_to_blocks("Before\n\n<sources>\n- a\n</sources>")
     assert all(block["type"] != "container" for block in blocks)
@@ -42,7 +45,7 @@ def test_block_tag_becomes_container_and_keeps_neighbors():
 
 After.
 """
-    blocks = markdown_to_blocks(markdown, {"tag_handlers": {"sources": _sources}})
+    blocks = markdown_to_blocks(markdown, {"xml_tag_handlers": {"sources": _sources}})
     assert [block["type"] for block in blocks] == ["section", "container", "section"]
     container = blocks[1]
     assert container["title"] == {"type": "plain_text", "text": "References"}
@@ -57,7 +60,7 @@ After.
 
 def test_detailed_collapses_and_renders_inner_markdown():
     markdown = "<detailed>\n## Investigation\nThe check failed because **disk** was full.\n</detailed>"
-    blocks = markdown_to_blocks(markdown, {"tag_handlers": {"detailed": _detailed}})
+    blocks = markdown_to_blocks(markdown, {"xml_tag_handlers": {"detailed": _detailed}})
     assert blocks[0]["type"] == "container"
     assert blocks[0]["default_collapsed"] is True
     assert blocks[0]["is_collapsible"] is True
@@ -69,26 +72,41 @@ def test_detailed_collapses_and_renders_inner_markdown():
     assert children[1]["text"]["text"] == "The check failed because *disk* was full."
 
 
-def test_nested_tags_and_boolean_attribute():
-    markdown = """<detailed collapsible>
-<sources title="Refs & notes">
-plain
-</sources>
-</detailed>"""
-    blocks = markdown_to_blocks(
-        markdown,
-        {"tag_handlers": {"detailed": _detailed, "sources": _sources}},
+def test_nested_tags_and_xml_entities():
+    amp = "&" + "amp;"
+    lt = "&" + "lt;"
+    markdown = (
+        '<detailed collapsible="true">\n'
+        f'<sources title="Refs {amp} notes">\n'
+        f"a {lt} b {amp} c\n"
+        "</sources>\n"
+        "</detailed>"
     )
+    blocks = markdown_to_blocks(markdown, HANDLERS)
     assert len(blocks) == 1
     inner = blocks[0]["child_blocks"]
     assert inner[0]["type"] == "container"
     assert inner[0]["title"]["text"] == "Refs & notes"
-    assert inner[0]["child_blocks"][0]["text"]["text"] == "plain"
+    assert inner[0]["child_blocks"][0]["text"]["text"] == "a < b & c"
+
+
+def test_markdown_body_is_not_parsed_as_xml():
+    markdown = "<sources>\na < b & c\n</sources>"
+    blocks = markdown_to_blocks(markdown, {"xml_tag_handlers": {"sources": _sources}})
+    assert blocks[0]["child_blocks"][0]["text"]["text"] == "a < b & c"
+
+
+def test_ill_formed_tag_is_left_alone():
+    blocks = markdown_to_blocks(
+        '<sources title="x" collapsible>\nHi\n</sources>',
+        {"xml_tag_handlers": {"sources": _sources}},
+    )
+    assert all(block["type"] != "container" for block in blocks)
 
 
 def test_tag_inside_fence_is_not_intercepted():
     markdown = "```\n<sources>\nsecret\n</sources>\n```"
-    blocks = markdown_to_blocks(markdown, {"tag_handlers": {"sources": _sources}})
+    blocks = markdown_to_blocks(markdown, {"xml_tag_handlers": {"sources": _sources}})
     assert blocks[0]["type"] == "rich_text"
     assert "secret" in blocks[0]["elements"][0]["elements"][0]["text"]
     assert all(block["type"] != "container" for block in blocks)
@@ -104,13 +122,16 @@ def test_self_closing_and_drop_empty():
 
     blocks = markdown_to_blocks(
         '<sources title="Empty" />',
-        {"tag_handlers": {"sources": sources, "detailed": _detailed}},
+        {"xml_tag_handlers": {"sources": sources, "detailed": _detailed}},
     )
     assert seen["body"] == ""
     assert seen["attrs"] == {"title": "Empty"}
     assert blocks == [container_block("Empty", [], collapsible=False)]
 
-    assert markdown_to_blocks("<detailed>\n\n</detailed>", {"tag_handlers": {"detailed": _detailed}}) == []
+    assert (
+        markdown_to_blocks("<detailed>\n\n</detailed>", {"xml_tag_handlers": {"detailed": _detailed}})
+        == []
+    )
 
 
 def test_none_falls_through_and_rich_text_mode_splits():
@@ -118,7 +139,10 @@ def test_none_falls_through_and_rich_text_mode_splits():
         return None
 
     raw = markdown_to_blocks("<sources>hello</sources>")
-    skipped = markdown_to_blocks("<sources>hello</sources>", {"tag_handlers": {"sources": ignore}})
+    skipped = markdown_to_blocks(
+        "<sources>hello</sources>",
+        {"xml_tag_handlers": {"sources": ignore}},
+    )
     assert skipped == raw
 
     def box(tag):
@@ -126,30 +150,30 @@ def test_none_falls_through_and_rich_text_mode_splits():
 
     blocks = markdown_to_blocks(
         "Before\n\n<sources>\nitem\n</sources>\n\nAfter",
-        {"tag_handlers": {"sources": box}, "preferSectionBlocks": False},
+        {"xml_tag_handlers": {"sources": box}, "preferSectionBlocks": False},
     )
     assert [block["type"] for block in blocks] == ["rich_text", "container", "rich_text"]
     assert blocks[1]["child_blocks"][0]["type"] == "rich_text"
 
 
 def test_process_wide_handler_can_be_overridden():
-    register_tag_handler("sources", _sources)
+    register_xml_tag_handler("sources", _sources)
     try:
         blocks = markdown_to_blocks("<sources>\nHi\n</sources>")
         assert blocks[0]["type"] == "container"
         disabled = markdown_to_blocks(
             "<sources>\nHi\n</sources>",
-            {"tag_handlers": {"sources": None}},
+            {"xml_tag_handlers": {"sources": None}},
         )
         assert all(block["type"] != "container" for block in disabled)
     finally:
-        clear_tag_handlers()
+        clear_xml_tag_handlers()
 
 
 def test_unclosed_tag_does_not_swallow_the_rest():
     blocks = markdown_to_blocks(
         "Keep this\n\n<sources>\nno close\n\nStill here",
-        {"tag_handlers": {"sources": _sources}},
+        {"xml_tag_handlers": {"sources": _sources}},
     )
     text = " ".join(
         block.get("text", {}).get("text", "")

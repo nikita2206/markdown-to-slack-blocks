@@ -67,9 +67,11 @@ Mention IDs are checked before conversion:
 
 and the rest of the ID is uppercase alphanumeric.
 
-### Custom XML tags
+### XML tag handlers
 
-Tags the library does not know, such as `<sources>` or `<detailed>`, are not Slack blocks. Pass `tag_handlers` to turn specific tags into whatever blocks you want. The handler sees the tag name, its attributes, and the inner Markdown. `convert` parses that inner Markdown with the same options, so nested tags work too.
+Tags the library does not know, such as `<sources>` or `<detailed>`, are not Slack blocks. Pass `xml_tag_handlers` (`xmlTagHandlers`) to turn specific elements into whatever blocks you want. The handler is called with an `XmlTagContext`: the element name, its attributes, and the inner Markdown. `convert` parses that inner Markdown with the same options, so nested elements work too.
+
+The tags are parsed with Python's [expat](https://docs.python.org/3/library/pyexpat.html) XML parser, not a regular expression. Names are case-sensitive. Attributes follow XML rules: values are quoted, and entities such as `&amp;` are decoded. The text inside the element is Markdown, so it is not parsed as XML. `a < b` and a raw `&` in the body are kept as written. An unclosed tag, or a `<` that is not well-formed XML, is left alone. Tags inside fenced code are left alone too.
 
 Slack's [`container`](https://docs.slack.dev/reference/block-kit/blocks/container-block/) block is the usual wrapper. `container_block` builds one. `child_blocks` holds at most 10 blocks, and the plain-text title is at most 150 characters.
 
@@ -91,7 +93,7 @@ def detailed(tag):
     )
 
 blocks = markdown_to_blocks(agent_markdown, {
-    "tag_handlers": {"sources": sources, "detailed": detailed},
+    "xml_tag_handlers": {"sources": sources, "detailed": detailed},
 })
 ```
 
@@ -108,9 +110,9 @@ The check failed because **disk** was full.
 </detailed>
 ```
 
-Return one block, a list of blocks, or an empty list to drop the tag. Return `None` to leave that occurrence as normal Markdown. Tags inside fenced code are not intercepted.
+Return one block, a list of blocks, or an empty list to drop the element. Return `None` to leave that occurrence as normal Markdown.
 
-`register_tag_handler("sources", sources)` installs a process-wide default. A `tag_handlers` entry overrides it, and setting the name to `None` there turns the global handler off for that call.
+`register_xml_tag_handler("sources", sources)` installs a process-wide default. An `xml_tag_handlers` entry overrides it, and setting the name to `None` there turns the global handler off for that call. `clear_xml_tag_handlers()` removes the defaults.
 
 ### Tables
 

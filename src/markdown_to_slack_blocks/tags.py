@@ -1,48 +1,42 @@
-"""Custom XML tags in Markdown, turned into Slack blocks by user handlers.
+"""XML tag handlers for Markdown that contains custom elements.
 
-Agent output often wraps a region in a tag such as ``<sources>`` or
-``<detailed>``. Register a handler for that tag name and it receives the
-inner Markdown, already convertible with the same options. A typical handler
-returns a Slack ``container`` block.
+Agent output often wraps a region in an element such as ``<sources>`` or
+``<detailed>``. Those tags are parsed with Python's expat XML parser
+(``xml.parsers.expat``). The handler receives the decoded attributes and the
+inner Markdown, unchanged, and usually returns a Slack ``container`` block.
+
+The text inside an element is Markdown, not XML, so it is not fed to the
+parser. A comparison such as ``a < b`` or a raw ``&`` in the body stays as
+it was written. Attribute values do go through the XML parser, which means
+they must be quoted and entities such as ``&`` are decoded.
 """
 
 from __future__ import annotations
 
 import re
+import xml.parsers.expat as expat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 Block = dict[str, Any]
-TagHandler = Callable[["TagContext"], Block | list[Block] | None]
+XmlTagHandler = Callable[["XmlTagContext"], Block | list[Block] | None]
 
-_REGISTRY: dict[str, TagHandler] = {}
+_REGISTRY: dict[str, XmlTagHandler] = {}
 
-_OPEN_TAG = re.compile(
-    r"<([A-Za-z][A-Za-z0-9_-]*)((?:\s+[^<>]*?)?)\s*(/?)>",
-)
-_CLOSE_TAG = re.compile(r"</([A-Za-z][A-Za-z0-9_-]*)\s*>")
-_ATTR = re.compile(
-    r"""([A-Za-z_:][\w:.-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?"""
-)
 _FENCE_OPEN = re.compile(r"^( {0,3})(`{3,}|~{3,})")
 _PLACEHOLDER = "\ue000mdslack:{}\ue000"
 _PLACEHOLDER_TEXT = re.compile(r"^\ue000mdslack:\d+\ue000$")
-_UNESCAPE = {
-    "amp": "&",
-    "lt": "<",
-    "gt": ">",
-    "quot": '"',
-    "apos": "'",
-}
+_MAX_TAG_LENGTH = 65536
 
 
 @dataclass(frozen=True)
-class TagContext:
-    """One custom tag found in the Markdown source.
+class XmlTagContext:
+    """One custom XML element found in the Markdown source.
 
-    ``convert`` parses ``body`` with the same options as the outer call,
-    including nested tag handlers.
+    ``name`` and ``attrs`` come from the XML parser. ``body`` is the original
+    Markdown between the start and end tags. ``convert`` parses that body
+    with the same options as the outer call, including nested XML tag handlers.
     """
 
     name: str
@@ -52,20 +46,20 @@ class TagContext:
     convert: Callable[[str], list[Block]]
 
 
-def register_tag_handler(name: str, handler: TagHandler | None) -> None:
+def register_xml_tag_handler(name: str, handler: XmlTagHandler | None) -> None:
     """Register a process-wide handler, or remove it when ``handler`` is None.
 
-    Per-call ``tag_handlers`` override this registry.
+    Per-call ``xml_tag_handlers`` override this registry. Names are
+    case-sensitive, matching XML.
     """
-    key = name.lower()
     if handler is None:
-        _REGISTRY.pop(key, None)
+        _REGISTRY.pop(name, None)
     else:
-        _REGISTRY[key] = handler
+        _REGISTRY[name] = handler
 
 
-def clear_tag_handlers() -> None:
-    """Remove every process-wide tag handler."""
+def clear_xml_tag_handlers() -> None:
+    """Remove every process-wide XML tag handler."""
     _REGISTRY.clear()
 
 
@@ -110,15 +104,15 @@ def container_block(
     return block
 
 
-def resolve_tag_handlers(options: Mapping[str, Any] | None) -> dict[str, TagHandler]:
+def resolve_xml_tag_handlers(options: Mapping[str, Any] | None) -> dict[str, XmlTagHandler]:
     resolved = dict(_REGISTRY)
     if not options:
         return resolved
-    custom = options.get("tag_handlers", options.get("tagHandlers"))
+    custom = options.get("xml_tag_handlers", options.get("xmlTagHandlers"))
     if not isinstance(custom, Mapping):
         return resolved
     for name, handler in custom.items():
-        key = str(name).lower()
+        key = str(name)
         if handler is None:
             resolved.pop(key, None)
         else:
@@ -126,21 +120,21 @@ def resolve_tag_handlers(options: Mapping[str, Any] | None) -> dict[str, TagHand
     return resolved
 
 
-def extract_custom_tags(
+def extract_xml_tags(
     markdown: str,
     names: set[str],
 ) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Replace outermost registered tags with placeholders.
+    """Replace outermost registered elements with placeholders.
 
-    Tags inside fenced code blocks are left alone. An unclosed tag is left
-    in the source so the rest of the document still converts.
+    Elements inside fenced code blocks are left alone. An element that never
+    closes, or a ``<`` that is not well-formed XML, is left in the source.
     """
     if not names or not markdown:
         return markdown, {}
 
     result: list[str] = []
     replacements: dict[str, dict[str, Any]] = {}
-    stack: list[tuple[str, dict[str, str], int, int]] = []
+    stack: list[tuple[str, dict[str, str], int]] = []
     outer_start = 0
     index = 0
     length = len(markdown)
@@ -161,43 +155,49 @@ def extract_custom_tags(
                 index = next_index
                 continue
 
-        if not in_fence and markdown.startswith("<", index):
-            opened = _OPEN_TAG.match(markdown, index)
-            if opened and opened.group(1).lower() in names and not opened.group(3):
-                name = opened.group(1).lower()
+        if not in_fence and _could_be_xml_tag(markdown, index):
+            start = _parse_start_tag(markdown[index : index + _MAX_TAG_LENGTH])
+            if start is not None and start["name"] in names:
                 if not stack:
                     outer_start = index
-                stack.append((name, _parse_attrs(opened.group(2) or ""), index, opened.end()))
-                index = opened.end()
-                continue
-            if opened and opened.group(3) and opened.group(1).lower() in names and not stack:
-                placeholder = _PLACEHOLDER.format(counter)
-                counter += 1
-                replacements[placeholder] = {
-                    "name": opened.group(1).lower(),
-                    "attrs": _parse_attrs(opened.group(2) or ""),
-                    "body": "",
-                    "raw": opened.group(0),
-                }
-                result.append(f"\n\n{placeholder}\n\n")
-                index = opened.end()
-                continue
-            closed = _CLOSE_TAG.match(markdown, index)
-            if closed and stack and closed.group(1).lower() == stack[-1][0]:
-                name, attrs, _raw_at, body_start = stack.pop()
-                index = closed.end()
-                if stack:
+                tag_end = index + start["length"]
+                if start["self_closing"]:
+                    if not stack:
+                        placeholder = _PLACEHOLDER.format(counter)
+                        counter += 1
+                        replacements[placeholder] = {
+                            "name": start["name"],
+                            "attrs": start["attrs"],
+                            "body": "",
+                            "raw": markdown[index:tag_end],
+                        }
+                        result.append(f"\n\n{placeholder}\n\n")
+                    index = tag_end
                     continue
-                placeholder = _PLACEHOLDER.format(counter)
-                counter += 1
-                replacements[placeholder] = {
-                    "name": name,
-                    "attrs": attrs,
-                    "body": markdown[body_start:closed.start()],
-                    "raw": markdown[outer_start:index],
-                }
-                result.append(f"\n\n{placeholder}\n\n")
+                stack.append((start["name"], start["attrs"], tag_end))
+                index = tag_end
                 continue
+
+            if stack and markdown.startswith("</", index):
+                end_length = _parse_end_tag(
+                    markdown[index : index + _MAX_TAG_LENGTH],
+                    stack[-1][0],
+                )
+                if end_length:
+                    name, attrs, body_start = stack.pop()
+                    raw_end = index + end_length
+                    if not stack:
+                        placeholder = _PLACEHOLDER.format(counter)
+                        counter += 1
+                        replacements[placeholder] = {
+                            "name": name,
+                            "attrs": attrs,
+                            "body": markdown[body_start:index],
+                            "raw": markdown[outer_start:raw_end],
+                        }
+                        result.append(f"\n\n{placeholder}\n\n")
+                    index = raw_end
+                    continue
 
         if not stack:
             result.append(markdown[index])
@@ -208,10 +208,10 @@ def extract_custom_tags(
     return "".join(result), replacements
 
 
-def apply_tag_replacements(
+def apply_xml_tag_replacements(
     blocks: list[Block],
     replacements: dict[str, dict[str, Any]],
-    handlers: dict[str, TagHandler],
+    handlers: dict[str, XmlTagHandler],
     options: Mapping[str, Any],
     convert: Callable[[str], list[Block]],
 ) -> list[Block]:
@@ -226,7 +226,7 @@ def apply_tag_replacements(
 def _expand_block(
     block: Block,
     replacements: dict[str, dict[str, Any]],
-    handlers: dict[str, TagHandler],
+    handlers: dict[str, XmlTagHandler],
     options: Mapping[str, Any],
     convert: Callable[[str], list[Block]],
 ) -> list[Block]:
@@ -261,14 +261,14 @@ def _expand_block(
 
 def _invoke(
     replacement: dict[str, Any],
-    handlers: dict[str, TagHandler],
+    handlers: dict[str, XmlTagHandler],
     options: Mapping[str, Any],
     convert: Callable[[str], list[Block]],
 ) -> list[Block]:
     handler = handlers.get(replacement["name"])
     if handler is None:
         return _convert_without(replacement["raw"], replacement["name"], options)
-    context = TagContext(
+    context = XmlTagContext(
         name=replacement["name"],
         attrs=replacement["attrs"],
         body=replacement["body"],
@@ -284,14 +284,103 @@ def _invoke(
 
 
 def _convert_without(source: str, name: str, options: Mapping[str, Any]) -> list[Block]:
-    """Reparse a tag as ordinary Markdown, without this tag's handler."""
+    """Reparse an element as ordinary Markdown, without this tag's handler."""
     from .parser import markdown_to_blocks
 
     fallback = dict(options)
-    disabled = dict(resolve_tag_handlers(options))
+    disabled = dict(resolve_xml_tag_handlers(options))
     disabled[name] = None
-    fallback["tag_handlers"] = disabled
+    fallback["xml_tag_handlers"] = disabled
     return markdown_to_blocks(source, fallback)
+
+
+def _could_be_xml_tag(text: str, index: int) -> bool:
+    if text[index] != "<" or index + 1 >= len(text):
+        return False
+    nxt = text[index + 1]
+    if nxt == "/":
+        return index + 2 < len(text) and (text[index + 2].isalpha() or text[index + 2] in "_:")
+    return nxt.isalpha() or nxt in "_:"
+
+
+def _parse_start_tag(fragment: str) -> dict[str, Any] | None:
+    """Parse one XML start tag at the front of ``fragment`` with expat."""
+    if not fragment.startswith("<") or fragment.startswith("</"):
+        return None
+    limit = min(len(fragment), _MAX_TAG_LENGTH)
+    found: dict[str, Any] | None = None
+    lo = 2
+    hi = limit
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        probed = _probe_start(fragment[:mid])
+        if probed is None:
+            lo = mid + 1
+        else:
+            found = probed
+            found["length"] = mid
+            hi = mid - 1
+    return found
+
+
+def _probe_start(snippet: str) -> dict[str, Any] | None:
+    parser = expat.ParserCreate()
+    info: dict[str, Any] = {}
+
+    def start(name: str, attrs: dict[str, str]) -> None:
+        info["name"] = name
+        info["attrs"] = {key: str(value) for key, value in attrs.items()}
+
+    def end(_name: str) -> None:
+        info["self_closing"] = True
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    try:
+        parser.Parse(snippet, False)
+    except expat.ExpatError:
+        if "name" not in info:
+            return None
+    if "name" not in info:
+        return None
+    info.setdefault("self_closing", False)
+    return info
+
+
+def _parse_end_tag(fragment: str, name: str) -> int | None:
+    """Return the length of a closing ``</name>`` tag, or None."""
+    if not fragment.startswith("</"):
+        return None
+    limit = min(len(fragment), _MAX_TAG_LENGTH)
+    found: int | None = None
+    lo = 3
+    hi = limit
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _probe_end(name, fragment[:mid]):
+            found = mid
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return found
+
+
+def _probe_end(name: str, snippet: str) -> bool:
+    parser = expat.ParserCreate()
+    closed = False
+
+    def end(tag_name: str) -> None:
+        nonlocal closed
+        if tag_name == name:
+            closed = True
+
+    parser.EndElementHandler = end
+    try:
+        parser.Parse(f"<{name}>", False)
+        parser.Parse(snippet, False)
+    except expat.ExpatError:
+        return closed
+    return closed
 
 
 def _match_placeholder(text: str) -> str | None:
@@ -310,38 +399,6 @@ def _match_section_placeholder(element: Mapping[str, Any]) -> str | None:
     if children[0].get("style"):
         return None
     return _match_placeholder(children[0].get("text") or "")
-
-
-def _parse_attrs(raw: str) -> dict[str, str]:
-    attrs: dict[str, str] = {}
-    for match in _ATTR.finditer(raw):
-        key = match.group(1)
-        if match.group(2) is not None:
-            value = match.group(2)
-        elif match.group(3) is not None:
-            value = match.group(3)
-        elif match.group(4) is not None:
-            value = match.group(4)
-        else:
-            value = "true"
-        attrs[key] = _unescape(value)
-    return attrs
-
-
-def _unescape(value: str) -> str:
-    return re.sub(
-        r"&(?:(amp|lt|gt|quot|apos)|#(\d+)|#x([0-9A-Fa-f]+));",
-        _unescape_entity,
-        value,
-    )
-
-
-def _unescape_entity(match: re.Match[str]) -> str:
-    if match.group(1):
-        return _UNESCAPE[match.group(1)]
-    if match.group(2):
-        return chr(int(match.group(2)))
-    return chr(int(match.group(3), 16))
 
 
 def _at_line_start(text: str, index: int) -> bool:

@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 from markdown_it import MarkdownIt
 
-from .tags import apply_tag_replacements, extract_custom_tags, resolve_tag_handlers
+from .tags import apply_xml_tag_replacements, extract_xml_tags, resolve_xml_tag_handlers
 from .validator import validate_options
 
 Block = dict[str, Any]
@@ -60,24 +60,25 @@ def markdown_to_blocks(
       or legacy ``"table"``.
     * ``table_caption`` / ``tableCaption`` — caption for ``data_table``.
       Default ``"Data table"``. Pass ``""`` to omit it.
-    * ``tag_handlers`` / ``tagHandlers`` — map of XML tag name to a function
-      ``(TagContext) -> block | list[block] | None``. The inner Markdown is
-      not parsed as a normal HTML block; the handler decides the blocks.
-      Use this to wrap ``<sources>`` or ``<detailed>`` in a ``container``.
+    * ``xml_tag_handlers`` / ``xmlTagHandlers`` — map of XML element name to a
+      function ``(XmlTagContext) -> block | list[block] | None``. Names are
+      case-sensitive. Expat parses the tags; the inner Markdown is passed
+      through unchanged. Use this to wrap ``<sources>`` or ``<detailed>`` in
+      a ``container``.
     """
     validate_options(options)
     options = options or {}
-    handlers = resolve_tag_handlers(options)
+    handlers = resolve_xml_tag_handlers(options)
     if not handlers:
         return _parse_markdown(markdown, options)
 
-    prepared, replacements = extract_custom_tags(markdown, set(handlers))
+    prepared, replacements = extract_xml_tags(markdown, set(handlers))
 
     def convert(source: str) -> list[Block]:
         return markdown_to_blocks(source, options)
 
     blocks = _parse_markdown(prepared, options)
-    return apply_tag_replacements(blocks, replacements, handlers, options, convert)
+    return apply_xml_tag_replacements(blocks, replacements, handlers, options, convert)
 
 
 def _flag(options: Mapping[str, Any], *names: str, default: Any = None) -> Any:
