@@ -1,0 +1,177 @@
+from markdown_to_slack_blocks import (
+    clear_tag_handlers,
+    container_block,
+    markdown_to_blocks,
+    register_tag_handler,
+)
+
+
+def _sources(tag):
+    return container_block(
+        tag.attrs.get("title") or "Sources",
+        tag.convert(tag.body),
+        collapsible=tag.attrs.get("collapsible") == "true",
+    )
+
+
+def _detailed(tag):
+    children = tag.convert(tag.body)
+    if not children:
+        return []
+    return container_block(
+        "Details",
+        children,
+        collapsible=True,
+        default_collapsed=True,
+    )
+
+
+def test_without_handlers_tags_stay_text():
+    blocks = markdown_to_blocks("Before\n\n<sources>\n- a\n</sources>")
+    assert all(block["type"] != "container" for block in blocks)
+    blob = str(blocks)
+    assert "sources" in blob
+
+
+def test_block_tag_becomes_container_and_keeps_neighbors():
+    markdown = """Answer text.
+
+<sources title="References">
+- [Runbook](https://example.com/runbook)
+</sources>
+
+After.
+"""
+    blocks = markdown_to_blocks(markdown, {"tag_handlers": {"sources": _sources}})
+    assert [block["type"] for block in blocks] == ["section", "container", "section"]
+    container = blocks[1]
+    assert container["title"] == {"type": "plain_text", "text": "References"}
+    assert container["is_collapsible"] is False
+    assert container["child_blocks"][0]["type"] == "rich_text"
+    item = container["child_blocks"][0]["elements"][0]["elements"][0]["elements"]
+    assert item[0]["type"] == "link"
+    assert item[0]["url"] == "https://example.com/runbook"
+    assert blocks[0]["text"]["text"] == "Answer text."
+    assert blocks[2]["text"]["text"] == "After."
+
+
+def test_detailed_collapses_and_renders_inner_markdown():
+    markdown = "<detailed>\n## Investigation\nThe check failed because **disk** was full.\n</detailed>"
+    blocks = markdown_to_blocks(markdown, {"tag_handlers": {"detailed": _detailed}})
+    assert blocks[0]["type"] == "container"
+    assert blocks[0]["default_collapsed"] is True
+    assert blocks[0]["is_collapsible"] is True
+    children = blocks[0]["child_blocks"]
+    assert children[0] == {
+        "type": "header",
+        "text": {"type": "plain_text", "text": "Investigation"},
+    }
+    assert children[1]["text"]["text"] == "The check failed because *disk* was full."
+
+
+def test_nested_tags_and_boolean_attribute():
+    markdown = """<detailed collapsible>
+<sources title="Refs & notes">
+plain
+</sources>
+</detailed>"""
+    blocks = markdown_to_blocks(
+        markdown,
+        {"tag_handlers": {"detailed": _detailed, "sources": _sources}},
+    )
+    assert len(blocks) == 1
+    inner = blocks[0]["child_blocks"]
+    assert inner[0]["type"] == "container"
+    assert inner[0]["title"]["text"] == "Refs & notes"
+    assert inner[0]["child_blocks"][0]["text"]["text"] == "plain"
+
+
+def test_tag_inside_fence_is_not_intercepted():
+    markdown = "```\n<sources>\nsecret\n</sources>\n```"
+    blocks = markdown_to_blocks(markdown, {"tag_handlers": {"sources": _sources}})
+    assert blocks[0]["type"] == "rich_text"
+    assert "secret" in blocks[0]["elements"][0]["elements"][0]["text"]
+    assert all(block["type"] != "container" for block in blocks)
+
+
+def test_self_closing_and_drop_empty():
+    seen = {}
+
+    def sources(tag):
+        seen["body"] = tag.body
+        seen["attrs"] = dict(tag.attrs)
+        return _sources(tag)
+
+    blocks = markdown_to_blocks(
+        '<sources title="Empty" />',
+        {"tag_handlers": {"sources": sources, "detailed": _detailed}},
+    )
+    assert seen["body"] == ""
+    assert seen["attrs"] == {"title": "Empty"}
+    assert blocks == [container_block("Empty", [], collapsible=False)]
+
+    assert markdown_to_blocks("<detailed>\n\n</detailed>", {"tag_handlers": {"detailed": _detailed}}) == []
+
+
+def test_none_falls_through_and_rich_text_mode_splits():
+    def ignore(_tag):
+        return None
+
+    raw = markdown_to_blocks("<sources>hello</sources>")
+    skipped = markdown_to_blocks("<sources>hello</sources>", {"tag_handlers": {"sources": ignore}})
+    assert skipped == raw
+
+    def box(tag):
+        return container_block("Box", tag.convert(tag.body))
+
+    blocks = markdown_to_blocks(
+        "Before\n\n<sources>\nitem\n</sources>\n\nAfter",
+        {"tag_handlers": {"sources": box}, "preferSectionBlocks": False},
+    )
+    assert [block["type"] for block in blocks] == ["rich_text", "container", "rich_text"]
+    assert blocks[1]["child_blocks"][0]["type"] == "rich_text"
+
+
+def test_process_wide_handler_can_be_overridden():
+    register_tag_handler("sources", _sources)
+    try:
+        blocks = markdown_to_blocks("<sources>\nHi\n</sources>")
+        assert blocks[0]["type"] == "container"
+        disabled = markdown_to_blocks(
+            "<sources>\nHi\n</sources>",
+            {"tag_handlers": {"sources": None}},
+        )
+        assert all(block["type"] != "container" for block in disabled)
+    finally:
+        clear_tag_handlers()
+
+
+def test_unclosed_tag_does_not_swallow_the_rest():
+    blocks = markdown_to_blocks(
+        "Keep this\n\n<sources>\nno close\n\nStill here",
+        {"tag_handlers": {"sources": _sources}},
+    )
+    text = " ".join(
+        block.get("text", {}).get("text", "")
+        for block in blocks
+        if block["type"] == "section"
+    )
+    assert "Keep this" in text
+    assert "Still here" in text
+    assert all(block["type"] != "container" for block in blocks)
+
+
+def test_container_helper_optional_fields():
+    block = container_block(
+        "Title",
+        [{"type": "divider"}],
+        subtitle="Sub",
+        width="wide",
+        block_id="sources-1",
+        collapsible=True,
+        default_collapsed=True,
+    )
+    assert block["width"] == "wide"
+    assert block["block_id"] == "sources-1"
+    assert block["subtitle"]["text"] == "Sub"
+    assert block["child_blocks"] == [{"type": "divider"}]

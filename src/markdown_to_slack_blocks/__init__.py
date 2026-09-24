@@ -11,12 +11,17 @@ from .splitter import (
     split_blocks,
     split_blocks_with_text,
 )
+from .tags import TagContext, clear_tag_handlers, container_block, register_tag_handler
 from .validator import validate_blocks_to_markdown_options, validate_options
 
 __all__ = [
+    "TagContext",
     "blocks_to_markdown",
     "blocks_to_plain_text",
+    "clear_tag_handlers",
+    "container_block",
     "markdown_to_blocks",
+    "register_tag_handler",
     "split_blocks",
     "split_blocks_with_text",
     "validate_blocks_to_markdown_options",

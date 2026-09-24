@@ -67,6 +67,51 @@ Mention IDs are checked before conversion:
 
 and the rest of the ID is uppercase alphanumeric.
 
+### Custom XML tags
+
+Tags the library does not know, such as `<sources>` or `<detailed>`, are not Slack blocks. Pass `tag_handlers` to turn specific tags into whatever blocks you want. The handler sees the tag name, its attributes, and the inner Markdown. `convert` parses that inner Markdown with the same options, so nested tags work too.
+
+Slack's [`container`](https://docs.slack.dev/reference/block-kit/blocks/container-block/) block is the usual wrapper. `container_block` builds one. `child_blocks` holds at most 10 blocks, and the plain-text title is at most 150 characters.
+
+```python
+from markdown_to_slack_blocks import container_block, markdown_to_blocks
+
+def sources(tag):
+    children = tag.convert(tag.body)
+    if not children:
+        return []
+    return container_block(tag.attrs.get("title") or "Sources", children, collapsible=True)
+
+def detailed(tag):
+    return container_block(
+        "Details",
+        tag.convert(tag.body),
+        collapsible=True,
+        default_collapsed=True,
+    )
+
+blocks = markdown_to_blocks(agent_markdown, {
+    "tag_handlers": {"sources": sources, "detailed": detailed},
+})
+```
+
+```xml
+Answer text.
+
+<sources title="References">
+- [Runbook](https://example.com/runbook)
+</sources>
+
+<detailed>
+## Investigation
+The check failed because **disk** was full.
+</detailed>
+```
+
+Return one block, a list of blocks, or an empty list to drop the tag. Return `None` to leave that occurrence as normal Markdown. Tags inside fenced code are not intercepted.
+
+`register_tag_handler("sources", sources)` installs a process-wide default. A `tag_handlers` entry overrides it, and setting the name to `None` there turns the global handler off for that call.
+
 ### Tables
 
 Cells are typed from their content:
