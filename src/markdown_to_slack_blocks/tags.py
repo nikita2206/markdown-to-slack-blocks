@@ -126,16 +126,15 @@ def extract_xml_tags(
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     """Replace outermost registered elements with placeholders.
 
-    Elements inside fenced code blocks are left alone. An element that never
-    closes, or a ``<`` that is not well-formed XML, is left in the source.
+    Elements inside fenced code blocks are left alone. A start tag with no
+    matching close, and a close tag with no matching open, stay in the
+    Markdown. Either one leaves later well-formed elements intact.
     """
     if not names or not markdown:
         return markdown, {}
 
     result: list[str] = []
     replacements: dict[str, dict[str, Any]] = {}
-    stack: list[tuple[str, dict[str, str], int]] = []
-    outer_start = 0
     index = 0
     length = len(markdown)
     in_fence = False
@@ -150,62 +149,95 @@ def extract_xml_tags(
             )
             if toggled is not None:
                 in_fence, fence_char, fence_len = toggled
-                if not stack:
-                    result.append(markdown[index:next_index])
+                result.append(markdown[index:next_index])
                 index = next_index
                 continue
 
         if not in_fence and _could_be_xml_tag(markdown, index):
-            start = _parse_start_tag(markdown[index : index + _MAX_TAG_LENGTH])
-            if start is not None and start["name"] in names:
-                if not stack:
-                    outer_start = index
-                tag_end = index + start["length"]
-                if start["self_closing"]:
-                    if not stack:
-                        placeholder = _PLACEHOLDER.format(counter)
-                        counter += 1
-                        replacements[placeholder] = {
-                            "name": start["name"],
-                            "attrs": start["attrs"],
-                            "body": "",
-                            "raw": markdown[index:tag_end],
-                        }
-                        result.append(f"\n\n{placeholder}\n\n")
-                    index = tag_end
-                    continue
-                stack.append((start["name"], start["attrs"], tag_end))
-                index = tag_end
+            element = _parse_element(markdown, index, names)
+            if element is not None:
+                placeholder = _PLACEHOLDER.format(counter)
+                counter += 1
+                replacements[placeholder] = element
+                result.append(f"\n\n{placeholder}\n\n")
+                index = element["end"]
                 continue
 
-            if stack and markdown.startswith("</", index):
-                end_length = _parse_end_tag(
-                    markdown[index : index + _MAX_TAG_LENGTH],
-                    stack[-1][0],
-                )
-                if end_length:
-                    name, attrs, body_start = stack.pop()
-                    raw_end = index + end_length
-                    if not stack:
-                        placeholder = _PLACEHOLDER.format(counter)
-                        counter += 1
-                        replacements[placeholder] = {
-                            "name": name,
-                            "attrs": attrs,
-                            "body": markdown[body_start:index],
-                            "raw": markdown[outer_start:raw_end],
-                        }
-                        result.append(f"\n\n{placeholder}\n\n")
-                    index = raw_end
-                    continue
-
-        if not stack:
-            result.append(markdown[index])
+        result.append(markdown[index])
         index += 1
 
-    if stack:
-        result.append(markdown[outer_start:])
     return "".join(result), replacements
+
+
+def _parse_element(
+    markdown: str,
+    index: int,
+    names: set[str],
+) -> dict[str, Any] | None:
+    """Parse one complete registered element, or return None if it is not.
+
+    None covers ordinary ``<`` characters (``2 < 5``), unknown tags, a close
+    tag that was never opened, and a start tag that never closes.
+    """
+    start = _parse_start_tag(markdown[index : index + _MAX_TAG_LENGTH])
+    if start is None or start["name"] not in names:
+        return None
+    tag_end = index + start["length"]
+    if start["self_closing"]:
+        return {
+            "name": start["name"],
+            "attrs": start["attrs"],
+            "body": "",
+            "raw": markdown[index:tag_end],
+            "end": tag_end,
+        }
+    found = _find_close(markdown, tag_end, start["name"])
+    if found is None:
+        return None
+    close_at, close_length = found
+    return {
+        "name": start["name"],
+        "attrs": start["attrs"],
+        "body": markdown[tag_end:close_at],
+        "raw": markdown[index : close_at + close_length],
+        "end": close_at + close_length,
+    }
+
+
+def _find_close(markdown: str, body_start: int, name: str) -> tuple[int, int] | None:
+    """Find the end tag that closes ``name``, skipping fences and nesting."""
+    depth = 1
+    index = body_start
+    length = len(markdown)
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    while index < length:
+        if _at_line_start(markdown, index):
+            toggled, next_index = _consume_fence_line(
+                markdown, index, in_fence, fence_char, fence_len
+            )
+            if toggled is not None:
+                in_fence, fence_char, fence_len = toggled
+                index = next_index
+                continue
+        if not in_fence and _could_be_xml_tag(markdown, index):
+            start = _parse_start_tag(markdown[index : index + _MAX_TAG_LENGTH])
+            if start is not None and start["name"] == name:
+                if not start["self_closing"]:
+                    depth += 1
+                index += start["length"]
+                continue
+            if markdown.startswith("</", index):
+                end_length = _parse_end_tag(markdown[index : index + _MAX_TAG_LENGTH], name)
+                if end_length:
+                    depth -= 1
+                    if depth == 0:
+                        return index, end_length
+                    index += end_length
+                    continue
+        index += 1
+    return None
 
 
 def apply_xml_tag_replacements(

@@ -71,7 +71,7 @@ and the rest of the ID is uppercase alphanumeric.
 
 Tags the library does not know, such as `<sources>` or `<detailed>`, are not Slack blocks. Pass `xml_tag_handlers` (`xmlTagHandlers`) to turn specific elements into whatever blocks you want. The handler is called with an `XmlTagContext`: the element name, its attributes, and the inner Markdown. `convert` parses that inner Markdown with the same options, so nested elements work too.
 
-The tags are parsed with Python's [expat](https://docs.python.org/3/library/pyexpat.html) XML parser, not a regular expression. Names are case-sensitive. Attributes follow XML rules: values are quoted, and entities such as `&amp;` are decoded. The text inside the element is Markdown, so it is not parsed as XML. `a < b` and a raw `&` in the body are kept as written. An unclosed tag, or a `<` that is not well-formed XML, is left alone. Tags inside fenced code are left alone too.
+The tags are parsed with Python's [expat](https://docs.python.org/3/library/pyexpat.html) XML parser, not a regular expression. Names are case-sensitive. Attributes follow XML rules: values are quoted, and entities such as `&amp;` are decoded. The text inside the element is Markdown, so it is not parsed as XML. `a < b` and a raw `&` in the body are kept as written. A start tag that never closes, and a close tag that was never opened, stay as Markdown and do not swallow a later well-formed element. Tags inside fenced code are left alone too.
 
 Slack's [`container`](https://docs.slack.dev/reference/block-kit/blocks/container-block/) block is the usual wrapper. `container_block` builds one. `child_blocks` holds at most 10 blocks, and the plain-text title is at most 150 characters.
 

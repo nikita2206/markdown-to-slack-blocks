@@ -29,6 +29,19 @@ def _detailed(tag):
 HANDLERS = {"xml_tag_handlers": {"sources": _sources, "detailed": _detailed}}
 
 
+def _block_texts(blocks):
+    texts = []
+    for block in blocks:
+        if block["type"] == "section":
+            texts.append(block["text"]["text"])
+        elif block["type"] == "rich_text":
+            for element in block["elements"]:
+                for child in element.get("elements") or []:
+                    if child.get("type") == "text":
+                        texts.append(child["text"])
+    return texts
+
+
 def test_without_handlers_tags_stay_text():
     blocks = markdown_to_blocks("Before\n\n<sources>\n- a\n</sources>")
     assert all(block["type"] != "container" for block in blocks)
@@ -183,6 +196,60 @@ def test_unclosed_tag_does_not_swallow_the_rest():
     assert "Keep this" in text
     assert "Still here" in text
     assert all(block["type"] != "container" for block in blocks)
+
+
+def test_llm_text_mixes_comparisons_closed_and_broken_tags():
+    """Prose, comparisons, a real element, a stray closer, then an unclosed tag.
+
+    The unclosed tag sits *before* a second well-formed element, which is the
+    shape an LLM produces when it opens a region and never finishes it.
+    """
+    markdown = """The check fails when load < 5 and latency > 200ms. 2<5 is also true.
+
+Ignore this stray closer </sources> and the mismatch </detailed>.
+
+<sources title="Runbook">
+Retry while attempts < 3 and queue > 0.
+- [Ops guide](https://example.com/ops)
+</sources>
+
+cpu < 90 is fine, and so is disk > 10. This opening tag never closes:
+
+<detailed>
+1 < 2 should stay visible, and so should the element after it.
+
+<sources>
+plain note with 4 > 1
+</sources>
+
+</not-opened>
+"""
+    blocks = markdown_to_blocks(markdown, HANDLERS)
+    containers = [block for block in blocks if block["type"] == "container"]
+    texts = _block_texts(blocks)
+
+    assert [block["type"] for block in blocks] == [
+        "section",
+        "section",
+        "container",
+        "section",
+        "rich_text",
+        "container",
+        "rich_text",
+    ]
+    assert [block["title"]["text"] for block in containers] == ["Runbook", "Sources"]
+    assert containers[0]["child_blocks"][0]["text"]["text"] == (
+        "Retry while attempts < 3 and queue > 0."
+    )
+    link = containers[0]["child_blocks"][1]["elements"][0]["elements"][0]["elements"][0]
+    assert link["url"] == "https://example.com/ops"
+    assert containers[1]["child_blocks"][0]["text"]["text"] == "plain note with 4 > 1"
+
+    assert texts[0] == "The check fails when load < 5 and latency > 200ms. 2<5 is also true."
+    assert "</sources>" in texts[1] and "</detailed>" in texts[1]
+    assert "cpu < 90" in texts[2] and "disk > 10" in texts[2]
+    assert texts[3] == "<detailed>\n1 < 2 should stay visible, and so should the element after it."
+    assert texts[4] == "</not-opened>"
 
 
 def test_container_helper_optional_fields():
