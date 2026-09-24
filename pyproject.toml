@@ -7,7 +7,8 @@ name = "markdown-to-slack-blocks"
 version = "1.0.0"
 description = "Convert Markdown (including GFM tables, mentions, and LLM output) into Slack Block Kit JSON, and back."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Nikita Nefedov" }]
 keywords = [
@@ -18,7 +19,6 @@ keywords = [
     "gfm",
 ]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
