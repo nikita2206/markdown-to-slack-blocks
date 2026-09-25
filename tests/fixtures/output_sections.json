@@ -118,7 +118,8 @@
             "type": "text",
             "text": "console.log('Code block');"
           }
-        ]
+        ],
+        "language": "javascript"
       }
     ]
   },
@@ -126,7 +127,7 @@
     "type": "section",
     "text": {
       "type": "mrkdwn",
-      "text": "This is a paragraph with text styles: *bold*, _italic_, ~strike~, `code`. And with non-formatted mentions: <@U12345>, <!here>, <!subteam^S12345>, #general. And with formatted mentions: <@U12345>, <#C00001>, <@S12345>, <@here>, <@T123456>.\nMentiones and styles inside code block are ignored: `<@U12345>, <#C00001>, <@S12345>, <@here>, <@T123456>, @jdoe, @here, @devs, #general, **bold**, *italic*, ~strike~ `"
+      "text": "This is a paragraph with text styles: *bold*, _italic_, ~strike~, `code`. And with non-formatted mentions: <@U12345>, <!here>, <!subteam^S12345>, #general. And with formatted mentions: <@U12345>, <#C00001>, <@S12345>, <@here>, <@T123456>.\nMentiones and styles inside code block are ignored: `&lt;@U12345&gt;, &lt;#C00001&gt;, &lt;@S12345&gt;, &lt;@here&gt;, &lt;@T123456&gt;, @jdoe, @here, @devs, #general, **bold**, *italic*, ~strike~ `"
     }
   },
   {
@@ -272,11 +273,11 @@
       [
         {
           "type": "raw_text",
-          "text": ""
+          "text": " "
         },
         {
           "type": "raw_text",
-          "text": ""
+          "text": " "
         }
       ],
       [

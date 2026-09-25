@@ -100,13 +100,13 @@ def test_nested_tags_and_xml_entities():
     inner = blocks[0]["child_blocks"]
     assert inner[0]["type"] == "container"
     assert inner[0]["title"]["text"] == "Refs & notes"
-    assert inner[0]["child_blocks"][0]["text"]["text"] == "a < b & c"
+    assert inner[0]["child_blocks"][0]["text"]["text"] == "a &lt; b &amp; c"
 
 
 def test_markdown_body_is_not_parsed_as_xml():
     markdown = "<sources>\na < b & c\n</sources>"
     blocks = markdown_to_blocks(markdown, {"xml_tag_handlers": {"sources": _sources}})
-    assert blocks[0]["child_blocks"][0]["text"]["text"] == "a < b & c"
+    assert blocks[0]["child_blocks"][0]["text"]["text"] == "a &lt; b &amp; c"
 
 
 def test_ill_formed_tag_is_left_alone():
@@ -183,19 +183,38 @@ def test_process_wide_handler_can_be_overridden():
         clear_xml_tag_handlers()
 
 
-def test_unclosed_tag_does_not_swallow_the_rest():
+def test_unclosed_tag_runs_until_next_registered_or_end():
     blocks = markdown_to_blocks(
         "Keep this\n\n<sources>\nno close\n\nStill here",
         {"xml_tag_handlers": {"sources": _sources}},
     )
-    text = " ".join(
-        block.get("text", {}).get("text", "")
-        for block in blocks
-        if block["type"] == "section"
+    assert blocks[0]["text"]["text"] == "Keep this"
+    assert blocks[1]["type"] == "container"
+    inside = " ".join(block["text"]["text"] for block in blocks[1]["child_blocks"])
+    assert "no close" in inside and "Still here" in inside
+    assert "<sources>" not in inside
+
+    nested = markdown_to_blocks(
+        "<detailed>\ninside detailed\n\n<sources>\nitem\n</sources>\n",
+        HANDLERS,
     )
-    assert "Keep this" in text
-    assert "Still here" in text
-    assert all(block["type"] != "container" for block in blocks)
+    assert [block["type"] for block in nested] == ["container", "container"]
+    assert nested[0]["title"]["text"] == "Details"
+    assert "inside detailed" in nested[0]["child_blocks"][0]["text"]["text"]
+    assert nested[1]["title"]["text"] == "Sources"
+    assert nested[1]["child_blocks"][0]["text"]["text"] == "item"
+
+
+def test_stray_registered_close_is_dropped():
+    blocks = markdown_to_blocks(
+        "Before </sources> and </detailed> after </not-opened>",
+        HANDLERS,
+    )
+    text = blocks[0]["text"]["text"]
+    assert "</sources>" not in text
+    assert "</detailed>" not in text
+    assert '&lt;/not-opened&gt;' in text
+    assert text.startswith("Before") and text.endswith("&lt;/not-opened&gt;")
 
 
 def test_llm_text_mixes_comparisons_closed_and_broken_tags():
@@ -227,29 +246,27 @@ plain note with 4 > 1
     blocks = markdown_to_blocks(markdown, HANDLERS)
     containers = [block for block in blocks if block["type"] == "container"]
     texts = _block_texts(blocks)
+    joined = "\n".join(texts)
 
-    assert [block["type"] for block in blocks] == [
-        "section",
-        "section",
-        "container",
-        "section",
-        "rich_text",
-        "container",
-        "rich_text",
+    assert [block["title"]["text"] for block in containers] == [
+        "Runbook",
+        "Details",
+        "Sources",
     ]
-    assert [block["title"]["text"] for block in containers] == ["Runbook", "Sources"]
     assert containers[0]["child_blocks"][0]["text"]["text"] == (
-        "Retry while attempts < 3 and queue > 0."
+        "Retry while attempts &lt; 3 and queue &gt; 0."
     )
     link = containers[0]["child_blocks"][1]["elements"][0]["elements"][0]["elements"][0]
     assert link["url"] == "https://example.com/ops"
-    assert containers[1]["child_blocks"][0]["text"]["text"] == "plain note with 4 > 1"
+    assert containers[2]["child_blocks"][0]["text"]["text"] == "plain note with 4 &gt; 1"
+    assert '1 &lt; 2' in containers[1]["child_blocks"][0]["text"]["text"]
+    assert all(block["type"] != "container" or block["title"]["text"] != "Details" or "plain note" not in str(block["child_blocks"]) for block in containers)
 
-    assert texts[0] == "The check fails when load < 5 and latency > 200ms. 2<5 is also true."
-    assert "</sources>" in texts[1] and "</detailed>" in texts[1]
-    assert "cpu < 90" in texts[2] and "disk > 10" in texts[2]
-    assert texts[3] == "<detailed>\n1 < 2 should stay visible, and so should the element after it."
-    assert texts[4] == "</not-opened>"
+    assert texts[0] == "The check fails when load &lt; 5 and latency &gt; 200ms. 2&lt;5 is also true."
+    assert "</sources>" not in joined and "</detailed>" not in joined
+    assert "stray closer" in joined and "mismatch" in joined
+    assert any("cpu &lt; 90" in text and "disk &gt; 10" in text for text in texts)
+    assert any("</not-opened>" in text or "&lt;/not-opened&gt;" in text for text in texts)
 
 
 def test_container_helper_optional_fields():

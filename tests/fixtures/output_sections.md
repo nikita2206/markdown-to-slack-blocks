@@ -16,7 +16,7 @@ This is a paragraph with **bold**, *italic*, ~strike~, `code`, and [link](<https
 
 > This is a quote.
 
-```
+```javascript
 console.log('Code block');
 ```
 
@@ -36,7 +36,7 @@ Mentiones and styles inside preformatted block are ignored: <@U12345>, <#C00001>
 | Column 1 | Column 2 |
 | --- | --- |
 | Cell can contain multiple paragraphs. | Paragraphs can include text styles: **bold**, \n *italic*, ~strike~, `code`. \n and  formatted mentions only: @jdoe, #general, @devs, <@here>, @T123456. \n Must be manually split with newlines. |
-|  |  |
+|   |   |
 | Cell can contain multiple paragraphs. | Cells |
 
 # Rich Text Elements

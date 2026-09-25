@@ -35,6 +35,21 @@ _WRAPPED_LIST = re.compile(r"^(\*\*|\*|_|~)(\d+\.|\*|-|\+)(\s+)(.*?)\1$")
 _TASK_ITEM = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+\[[ xX]\]\s?(.*)$")
 _FENCE_OPEN = re.compile(r"^(\s{0,3})(`{3,}|~{3,})")
 _NUMERIC = re.compile(r"^-?[0-9]+(\.[0-9]+)?$")
+_SLACK_MRKDWN_TOKEN = re.compile(
+    r"^(?:<!here>|<!channel>|<!everyone>"
+    r"|<@[A-Za-z0-9_.-]+>"
+    r"|<#[A-Za-z0-9_.-]+>"
+    r"|<!subteam\^[A-Za-z0-9_.-]+>"
+    r"|<!date\^[0-9]+\^[^|]+\|[^>]+>)$"
+)
+
+# Slack data_table limits: header counts as a row, and cell text is summed.
+DATA_TABLE_MIN_ROWS = 2
+DATA_TABLE_MAX_ROWS = 201
+DATA_TABLE_MAX_COLUMNS = 20
+DATA_TABLE_MAX_CELL_CHARACTERS = 20_000
+EMPTY_DATA_TABLE_CELL = " "
+SLACK_HEADER_MAX = 150
 
 _MD = MarkdownIt(
     "commonmark",
@@ -316,7 +331,12 @@ def _parse_block(tokens: list[Any], index: int) -> tuple[Node | None, int]:
     if kind in ("bullet_list_open", "ordered_list_open"):
         return _parse_list(tokens, index)
     if kind in ("fence", "code_block"):
-        return {"type": "code", "value": _code_value(token.content)}, index + 1
+        info = (getattr(token, "info", None) or "").strip()
+        language = info.split(None, 1)[0] if info else ""
+        node = {"type": "code", "value": _code_value(token.content)}
+        if language:
+            node["language"] = language
+        return node, index + 1
     if kind == "blockquote_open":
         children, index = _parse_container(tokens, index, "blockquote_close")
         return {"type": "blockquote", "children": children}, index
@@ -354,35 +374,7 @@ def _parse_markdown(markdown: str, options: Mapping[str, Any]) -> list[Block]:
         kind = node["type"]
         if kind == "heading":
             flush()
-            text = _node_to_string(node)
-            if node["depth"] <= 2:
-                blocks.append(
-                    {"type": "header", "text": {"type": "plain_text", "text": text}}
-                )
-            elif _flag(options, "prefer_section_blocks", "preferSectionBlocks", default=True) is not False:
-                blocks.append(
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"*{_inlines_to_mrkdwn(node['children'], options)}*",
-                        },
-                    }
-                )
-            else:
-                blocks.append(
-                    {
-                        "type": "rich_text",
-                        "elements": [
-                            {
-                                "type": "rich_text_section",
-                                "elements": [
-                                    {"type": "text", "text": text, "style": {"bold": True}}
-                                ],
-                            }
-                        ],
-                    }
-                )
+            blocks.extend(_heading_blocks(node, options))
         elif kind == "paragraph":
             children = node["children"]
             if len(children) == 1 and children[0]["type"] == "image":
@@ -418,12 +410,13 @@ def _parse_markdown(markdown: str, options: Mapping[str, Any]) -> list[Block]:
                 current.append(element)
             flush()
         elif kind == "code":
-            current.append(
-                {
-                    "type": "rich_text_preformatted",
-                    "elements": [{"type": "text", "text": node["value"]}],
-                }
-            )
+            element: dict[str, Any] = {
+                "type": "rich_text_preformatted",
+                "elements": [{"type": "text", "text": node["value"]}],
+            }
+            if node.get("language"):
+                element["language"] = node["language"]
+            current.append(element)
             flush()
         elif kind == "blockquote":
             elements: list[dict[str, Any]] = []
@@ -466,10 +459,7 @@ def _parse_markdown(markdown: str, options: Mapping[str, Any]) -> list[Block]:
             else:
                 rows = [[_build_data_table_cell(elements) for elements in row] for row in cell_elements]
                 caption = _flag(options, "table_caption", "tableCaption", default="Data table")
-                block: Block = {"type": "data_table", "rows": rows}
-                if caption:
-                    block = {"type": "data_table", "caption": caption, "rows": rows}
-                blocks.append(block)
+                blocks.extend(expand_data_table(rows, caption if caption else None))
         elif kind == "html":
             current.append(
                 {
@@ -525,9 +515,81 @@ def _process_list(list_node: Node, indent: int, options: Mapping[str, Any]) -> l
     return results
 
 
+def _heading_blocks(node: Node, options: Mapping[str, Any]) -> list[Block]:
+    text = _node_to_string(node)
+    prefer_section = _flag(options, "prefer_section_blocks", "preferSectionBlocks", default=True) is not False
+    if node["depth"] <= 2 and len(text) <= SLACK_HEADER_MAX:
+        return [{"type": "header", "text": {"type": "plain_text", "text": text}}]
+    if prefer_section:
+        return [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*{_inlines_to_mrkdwn(node['children'], options)}*",
+                },
+            }
+        ]
+    return [
+        {
+            "type": "rich_text",
+            "elements": [
+                {
+                    "type": "rich_text_section",
+                    "elements": [{"type": "text", "text": text, "style": {"bold": True}}],
+                }
+            ],
+        }
+    ]
+
+
+def escape_mrkdwn(text: str) -> str:
+    """Escape Slack mrkdwn control characters. Ampersand is escaped first."""
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def heading_text_to_sections(text: str, max_chars: int, block_id: str | None = None) -> list[Block]:
+    """Bold mrkdwn sections used when a header is longer than Slack allows."""
+    inner_limit = max(1, max_chars - 2)
+    chunks = _chunk_heading(text, inner_limit)
+    blocks: list[Block] = []
+    for index, chunk in enumerate(chunks):
+        block: Block = {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{escape_mrkdwn(chunk)}*"},
+        }
+        if index == 0 and block_id:
+            block["block_id"] = block_id
+        blocks.append(block)
+    return blocks
+
+
+def _chunk_heading(text: str, limit: int) -> list[str]:
+    """Local chunker so the parser does not import the splitter."""
+    chunks: list[str] = []
+    current = text
+    while current:
+        if len(current) <= limit:
+            chunks.append(current)
+            break
+        newline_index = current.rfind("\n", 0, limit + 1)
+        if newline_index > 0:
+            chunks.append(current[:newline_index])
+            current = current[newline_index + 1 :]
+            continue
+        space_index = current.rfind(" ", 0, limit + 1)
+        if space_index != -1 and space_index > limit * 0.8:
+            chunks.append(current[:space_index])
+            current = current[space_index + 1 :]
+            continue
+        chunks.append(current[:limit])
+        current = current[limit:]
+    return chunks or [text]
+
+
 def _build_data_table_cell(elements: list[dict[str, Any]]) -> dict[str, Any]:
-    if not elements:
-        return {"type": "raw_text", "text": ""}
+    if _elements_are_blank(elements):
+        return {"type": "raw_text", "text": EMPTY_DATA_TABLE_CELL}
     if len(elements) == 1:
         element = elements[0]
         style = element.get("style") or {}
@@ -540,6 +602,120 @@ def _build_data_table_cell(elements: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "type": "rich_text",
         "elements": [{"type": "rich_text_section", "elements": elements}],
+    }
+
+
+def _elements_are_blank(elements: list[dict[str, Any]]) -> bool:
+    if not elements:
+        return True
+    return all(element.get("type") == "text" and not (element.get("text") or "") for element in elements)
+
+
+def _cell_plain_text(cell: Mapping[str, Any]) -> str:
+    kind = cell.get("type")
+    if kind in ("raw_text", "raw_number"):
+        return str(cell.get("text") or "")
+    if kind != "rich_text":
+        return ""
+    parts: list[str] = []
+    for element in cell.get("elements") or []:
+        for item in element.get("elements") or []:
+            if item.get("type") == "text":
+                parts.append(item.get("text") or "")
+    return "".join(parts)
+
+
+def _row_text_length(row: list[Mapping[str, Any]]) -> int:
+    return sum(len(_cell_plain_text(cell)) for cell in row)
+
+
+def expand_data_table(rows: list[list[dict[str, Any]]], caption: str | None = None) -> list[Block]:
+    """Turn parsed rows into Slack tables that fit ``data_table`` limits.
+
+    Fewer than two rows, or more than 20 columns, becomes one legacy ``table``.
+    Too many rows or cell characters are split, repeating the header. A single
+    header-plus-row that is already over the character limit becomes a legacy
+    ``table`` as well.
+    """
+    if not rows:
+        return []
+    width = max((len(row) for row in rows), default=0)
+    if width > DATA_TABLE_MAX_COLUMNS or len(rows) < DATA_TABLE_MIN_ROWS:
+        return [_legacy_table(rows)]
+
+    header = rows[0]
+    body = rows[1:]
+    blocks: list[Block] = []
+    current: list[list[dict[str, Any]]] = [header]
+    current_chars = _row_text_length(header)
+
+    def flush() -> None:
+        nonlocal current, current_chars
+        if len(current) >= DATA_TABLE_MIN_ROWS:
+            blocks.append(_data_table_block(current, caption))
+        current = [header]
+        current_chars = _row_text_length(header)
+
+    for row in body:
+        row_chars = _row_text_length(row)
+        if len(current) >= DATA_TABLE_MIN_ROWS and (
+            len(current) + 1 > DATA_TABLE_MAX_ROWS
+            or current_chars + row_chars > DATA_TABLE_MAX_CELL_CHARACTERS
+        ):
+            flush()
+        if len(current) == 1 and current_chars + row_chars > DATA_TABLE_MAX_CELL_CHARACTERS:
+            blocks.append(_legacy_table([header, row]))
+            continue
+        current.append(row)
+        current_chars += row_chars
+        if len(current) >= DATA_TABLE_MAX_ROWS:
+            flush()
+    if len(current) >= DATA_TABLE_MIN_ROWS:
+        blocks.append(_data_table_block(current, caption))
+    return blocks or [_legacy_table(rows)]
+
+
+def _data_table_block(rows: list[list[dict[str, Any]]], caption: str | None) -> Block:
+    block: Block = {"type": "data_table", "rows": rows}
+    if caption:
+        block["caption"] = caption
+    return block
+
+
+def _legacy_table(rows: list[list[dict[str, Any]]]) -> Block:
+    return {"type": "table", "rows": [[_data_cell_to_table_cell(cell) for cell in row] for row in rows]}
+
+
+def data_table_to_table(block: Block) -> Block:
+    """Rewrite a ``data_table`` as the legacy ``table`` block containers allow."""
+    table = _legacy_table(block.get("rows") or [])
+    if block.get("block_id"):
+        table["block_id"] = block["block_id"]
+    return table
+
+
+def coerce_container_children(children: list[Block]) -> list[Block]:
+    """Replace ``data_table`` children with ``table`` blocks Slack will accept."""
+    coerced: list[Block] = []
+    for child in children:
+        if child.get("type") != "data_table":
+            coerced.append(child)
+            continue
+        for block in expand_data_table(child.get("rows") or [], child.get("caption")):
+            if block.get("type") == "data_table":
+                coerced.append(data_table_to_table(block))
+            else:
+                coerced.append(block)
+    return coerced
+
+
+def _data_cell_to_table_cell(cell: Mapping[str, Any]) -> dict[str, Any]:
+    if cell.get("type") == "rich_text":
+        return dict(cell)
+    text = _cell_plain_text(cell) or EMPTY_DATA_TABLE_CELL
+    return {
+        "type": "rich_text",
+        "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": text}]}],
     }
 
 
@@ -727,7 +903,9 @@ def _inline_to_mrkdwn(node: Node, options: Mapping[str, Any]) -> str:
     if kind == "text":
         return _text_to_mrkdwn(node["value"], options)
     if kind == "html":
-        return node["value"]
+        if _SLACK_MRKDWN_TOKEN.fullmatch(node["value"]):
+            return node["value"]
+        return escape_mrkdwn(node["value"])
     if kind == "emphasis":
         return f"_{_inlines_to_mrkdwn(node['children'], options)}_"
     if kind == "strong":
@@ -735,11 +913,12 @@ def _inline_to_mrkdwn(node: Node, options: Mapping[str, Any]) -> str:
     if kind == "delete":
         return f"~{_inlines_to_mrkdwn(node['children'], options)}~"
     if kind == "inlineCode":
-        return f"`{node['value']}`"
+        return f"`{escape_mrkdwn(node['value'])}`"
     if kind == "link":
-        return f"<{node['url']}|{_node_to_string(node)}>"
+        return f"<{escape_mrkdwn(node['url'])}|{escape_mrkdwn(_node_to_string(node))}>"
     if kind == "image":
-        return f"<{node['url']}|{node['alt'] or 'Image'}>"
+        alt = node["alt"] or "Image"
+        return f"<{escape_mrkdwn(node['url'])}|{escape_mrkdwn(alt)}>"
     return ""
 
 
@@ -754,7 +933,7 @@ def _text_to_mrkdwn(text: str, options: Mapping[str, Any]) -> str:
     last = 0
     for match in _TOKEN_RE.finditer(text):
         if match.start() > last:
-            result.append(text[last : match.start()])
+            result.append(escape_mrkdwn(text[last : match.start()]))
         full = match.group(0)
         if match.group(1) or match.group(3) or match.group(4) or match.group(6) or match.group(8) or match.group(10) or match.group(14):
             result.append(full)
@@ -769,16 +948,16 @@ def _text_to_mrkdwn(text: str, options: Mapping[str, Any]) -> str:
             elif name in teams:
                 result.append(f"<!subteam^{teams[name]}>")
             else:
-                result.append(full)
+                result.append(escape_mrkdwn(full))
         elif match.group(18):
             name = match.group(18)
             if name in channels:
                 result.append(f"<#{channels[name]}>")
             else:
-                result.append(full)
+                result.append(escape_mrkdwn(full))
         else:
-            result.append(full)
+            result.append(escape_mrkdwn(full))
         last = match.end()
     if last < len(text):
-        result.append(text[last:])
+        result.append(escape_mrkdwn(text[last:]))
     return "".join(result)

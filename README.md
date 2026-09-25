@@ -2,7 +2,7 @@
 
 Convert Markdown into Slack [Block Kit](https://api.slack.com/block-kit) JSON, and render blocks back to Markdown or plain text.
 
-This is a Python port of [udivankin/markdown-to-slack-blocks](https://github.com/udivankin/markdown-to-slack-blocks) v1.6.1 (MIT), released here as 1.0.0. It is aimed at the same job: take Markdown from people or from an LLM and post it to Slack without losing headings, lists, code, tables, or mentions.
+This is a Python port of [udivankin/markdown-to-slack-blocks](https://github.com/udivankin/markdown-to-slack-blocks) v1.6.1 (MIT), released here as 1.1.0. It is aimed at the same job: take Markdown from people or from an LLM and post it to Slack without losing headings, lists, code, tables, or mentions.
 
 ```bash
 pip install markdown-to-slack-blocks
@@ -24,14 +24,16 @@ This is a **bold** statement.
 | Markdown | Block |
 | --- | --- |
 | Paragraphs | `section` (`mrkdwn`) by default, or `rich_text` |
-| `#` / `##` | `header` |
+| `#` / `##` | `header` when the plain text is at most 150 characters, otherwise the bold form used for `###` |
 | `###` and below | bold `section`, or a bold `rich_text` section |
-| Lists, quotes, fenced code | `rich_text` (`rich_text_list`, `rich_text_quote`, `rich_text_preformatted`) |
+| Lists, quotes, fenced code | `rich_text` (`rich_text_list`, `rich_text_quote`, `rich_text_preformatted`). A fence info string such as `python` is copied to `language` |
 | `---` | `divider` |
 | A paragraph that is only an image | `image` |
 | GFM tables | `data_table` (or legacy `table`) |
 
 Inline styles become Slack mrkdwn (`*bold*`, `_italic_`, `~strike~`, `` `code` ``) inside sections, and `rich_text` style objects otherwise. Links become `<url|label>`.
+
+Section mrkdwn escapes `&`, `<`, and `>` as `&amp;`, `&lt;`, and `&gt;`, except for tokens this library emits (`<url|label>`, `<@U…>`, `<#C…>`, `<!…>`). `rich_text` text is left as written, because Slack does not parse mrkdwn there. A `header` block is plain text and is not escaped. A heading longer than 150 characters is emitted as a bold section instead, and that text is escaped.
 
 Slack-specific tokens are recognized in the text:
 
@@ -71,9 +73,11 @@ and the rest of the ID is uppercase alphanumeric.
 
 Tags the library does not know, such as `<sources>` or `<detailed>`, are not Slack blocks. Pass `xml_tag_handlers` (`xmlTagHandlers`) to turn specific elements into whatever blocks you want. The handler is called with an `XmlTagContext`: the element name, its attributes, and the inner Markdown. `convert` parses that inner Markdown with the same options, so nested elements work too.
 
-The tags are parsed with Python's [expat](https://docs.python.org/3/library/pyexpat.html) XML parser, not a regular expression. Names are case-sensitive. Attributes follow XML rules: values are quoted, and entities such as `&amp;` are decoded. The text inside the element is Markdown, so it is not parsed as XML. `a < b` and a raw `&` in the body are kept as written. A start tag that never closes, and a close tag that was never opened, stay as Markdown and do not swallow a later well-formed element. Tags inside fenced code are left alone too.
+The tags are parsed with Python's [expat](https://docs.python.org/3/library/pyexpat.html) XML parser, not a regular expression. Names are case-sensitive. Attributes follow XML rules: values are quoted, and entities such as `&amp;` are decoded. The text inside the element is Markdown, so it is not parsed as XML. `a < b` and a raw `&` in the body are kept as written. Tags inside fenced code are left alone.
 
-Slack's [`container`](https://docs.slack.dev/reference/block-kit/blocks/container-block/) block is the usual wrapper. `container_block` builds one. `child_blocks` holds at most 10 blocks, and the plain-text title is at most 150 characters.
+Registered names are lenient, because registering a handler means you expect that tag. A matching close tag still wins, so nesting works. If the start tag never closes, the body runs until the next registered start tag, or to the end of the input, and it does not swallow a later element. A stray close tag for a registered name is dropped. Unregistered tags, and comparisons such as `2 < 5`, stay as Markdown.
+
+Slack's [`container`](https://docs.slack.dev/reference/block-kit/blocks/container-block/) block is the usual wrapper. `container_block` builds one. Slack allows at most 10 children and a plain-text title of at most 150 characters; `split_blocks` enforces both. A `data_table` is not a legal container child, so `container_block` rewrites those children to the legacy `table` block.
 
 ```python
 from markdown_to_slack_blocks import container_block, markdown_to_blocks
@@ -124,9 +128,15 @@ Cells are typed from their content:
 | A plain number (`10`, `-3.5`) | `raw_number` |
 | Styles, links, mentions, emoji | `rich_text` |
 
+An empty cell is a single space. Slack rejects `raw_text` whose text is empty.
+
+A `data_table` must have at least 2 rows including the header, at most 20 columns, at most 201 rows, and at most 20,000 characters of cell text. More than 20 columns, or fewer than 2 rows, becomes one legacy `table`. Extra rows, or a character count past 20,000, are split into further `data_table` blocks that repeat the header. One header plus one row that is already over 20,000 characters becomes a legacy `table` by itself.
+
 ### Large messages
 
-Slack rejects messages that are too big. `split_blocks` cuts on block boundaries, then inside `rich_text`, then by line inside code blocks. Section and header text is chunked at 3,000 characters first.
+Slack rejects messages that are too big. `split_blocks` cuts on block boundaries, then inside `rich_text`, then by line inside code blocks. The fence `language` is kept on each piece. Section text is chunked at 3,000 characters. A header longer than 150 characters is rewritten as bold sections (the same form as a `###` heading) instead of being split as a `header` block.
+
+A container that has more than 10 children, or whose JSON is over the size limit, becomes several containers with the same settings. Later pieces use the title `{title} (continued)`, truncated so a plain-text title stays within 150 characters. Children are normalised first: sections and headers are chunked, nested containers are split, and any `data_table` is rewritten to `table`.
 
 ```python
 from markdown_to_slack_blocks import markdown_to_blocks, split_blocks_with_text
@@ -142,7 +152,7 @@ Limits default to 40 blocks and 12,000 JSON characters (`max_blocks` / `maxBlock
 ```python
 from markdown_to_slack_blocks import blocks_to_markdown, blocks_to_plain_text
 
-text = blocks_to_plain_text(blocks)  # chat.postMessage fallback
+text = blocks_to_plain_text(blocks)  # chat.postMessage fallback; a container contributes its title only
 markdown = blocks_to_markdown(blocks, {
     "mentions": {
         "users": {"U123456": "username"},

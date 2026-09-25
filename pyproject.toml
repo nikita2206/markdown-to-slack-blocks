@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "markdown-to-slack-blocks"
-version = "1.0.0"
+version = "1.1.0"
 description = "Convert Markdown (including GFM tables, mentions, and LLM output) into Slack Block Kit JSON, and back."
 readme = "README.md"
 license = "MIT"

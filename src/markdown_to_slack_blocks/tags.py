@@ -82,7 +82,7 @@ def container_block(
     (plain text, at most 150 characters) or ``rich_text_title``.
     ``width`` is ``narrow``, ``standard``, ``wide``, or ``full``.
     """
-    block: Block = {"type": "container", "child_blocks": list(child_blocks)}
+    block: Block = {"type": "container", "child_blocks": _container_children(list(child_blocks))}
     if rich_text_title is not None:
         block["rich_text_title"] = dict(rich_text_title)
     else:
@@ -102,6 +102,12 @@ def container_block(
     if has_header_divider is not None:
         block["has_header_divider"] = has_header_divider
     return block
+
+
+def _container_children(children: list[Block]) -> list[Block]:
+    from .parser import coerce_container_children
+
+    return coerce_container_children(children)
 
 
 def resolve_xml_tag_handlers(options: Mapping[str, Any] | None) -> dict[str, XmlTagHandler]:
@@ -126,9 +132,10 @@ def extract_xml_tags(
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     """Replace outermost registered elements with placeholders.
 
-    Elements inside fenced code blocks are left alone. A start tag with no
-    matching close, and a close tag with no matching open, stay in the
-    Markdown. Either one leaves later well-formed elements intact.
+    Elements inside fenced code blocks are left alone. For a registered name,
+    a start tag with no close runs until the next registered start tag or the
+    end of the input, and a close tag that was never opened is dropped.
+    Unregistered tags stay in the Markdown.
     """
     if not names or not markdown:
         return markdown, {}
@@ -162,6 +169,10 @@ def extract_xml_tags(
                 result.append(f"\n\n{placeholder}\n\n")
                 index = element["end"]
                 continue
+            close_length = _registered_close_length(markdown[index:], names)
+            if close_length:
+                index += close_length
+                continue
 
         result.append(markdown[index])
         index += 1
@@ -174,10 +185,11 @@ def _parse_element(
     index: int,
     names: set[str],
 ) -> dict[str, Any] | None:
-    """Parse one complete registered element, or return None if it is not.
+    """Parse one registered element, or return None if this is not one.
 
-    None covers ordinary ``<`` characters (``2 < 5``), unknown tags, a close
-    tag that was never opened, and a start tag that never closes.
+    A matching close tag wins. Otherwise the element runs to the next
+    registered start tag, or to the end of the input. Ordinary ``<``
+    characters such as ``2 < 5``, and unregistered tags, return None.
     """
     start = _parse_start_tag(markdown[index : index + _MAX_TAG_LENGTH])
     if start is None or start["name"] not in names:
@@ -192,15 +204,23 @@ def _parse_element(
             "end": tag_end,
         }
     found = _find_close(markdown, tag_end, start["name"])
-    if found is None:
-        return None
-    close_at, close_length = found
+    if found is not None:
+        close_at, close_length = found
+        return {
+            "name": start["name"],
+            "attrs": start["attrs"],
+            "body": markdown[tag_end:close_at],
+            "raw": markdown[index : close_at + close_length],
+            "end": close_at + close_length,
+        }
+    boundary = _find_next_registered_start(markdown, tag_end, names)
+    end = len(markdown) if boundary is None else boundary
     return {
         "name": start["name"],
         "attrs": start["attrs"],
-        "body": markdown[tag_end:close_at],
-        "raw": markdown[index : close_at + close_length],
-        "end": close_at + close_length,
+        "body": markdown[tag_end:end],
+        "raw": markdown[index:end],
+        "end": end,
     }
 
 
@@ -237,6 +257,40 @@ def _find_close(markdown: str, body_start: int, name: str) -> tuple[int, int] | 
                     index += end_length
                     continue
         index += 1
+    return None
+
+
+def _find_next_registered_start(markdown: str, start: int, names: set[str]) -> int | None:
+    """Index of the next registered start tag, skipping fenced code."""
+    index = start
+    length = len(markdown)
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    while index < length:
+        if _at_line_start(markdown, index):
+            toggled, next_index = _consume_fence_line(
+                markdown, index, in_fence, fence_char, fence_len
+            )
+            if toggled is not None:
+                in_fence, fence_char, fence_len = toggled
+                index = next_index
+                continue
+        if not in_fence and _could_be_xml_tag(markdown, index) and not markdown.startswith("</", index):
+            parsed = _parse_start_tag(markdown[index : index + _MAX_TAG_LENGTH])
+            if parsed is not None and parsed["name"] in names:
+                return index
+        index += 1
+    return None
+
+
+def _registered_close_length(fragment: str, names: set[str]) -> int | None:
+    if not fragment.startswith("</"):
+        return None
+    for name in names:
+        length = _parse_end_tag(fragment, name)
+        if length:
+            return length
     return None
 
 

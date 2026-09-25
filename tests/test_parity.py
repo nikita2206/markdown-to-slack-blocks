@@ -427,9 +427,9 @@ def test_split_block_counts_and_text():
     assert newline_split[0][1]["text"]["text"] == part2
 
     header = split_blocks([{"type": "header", "text": {"type": "plain_text", "text": "H" * 3500}}])
-    assert header[0][0]["type"] == "header"
-    assert header[0][1]["type"] == "section"
-    assert len(header[0][0]["text"]["text"]) == 3000
+    assert all(block["type"] == "section" for block in header[0])
+    assert all(len(block["text"]["text"]) <= 3000 for block in header[0])
+    assert "".join(block["text"]["text"].replace("*", "") for block in header[0]) == "H" * 3500
 
     with_text = split_blocks_with_text(
         [

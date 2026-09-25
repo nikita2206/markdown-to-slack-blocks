@@ -7,6 +7,11 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from .parser import (
+    SLACK_HEADER_MAX,
+    coerce_container_children,
+    heading_text_to_sections,
+)
 from .validator import validate_blocks_to_markdown_options
 
 Block = dict[str, Any]
@@ -30,8 +35,11 @@ def split_blocks(
 ) -> list[list[Block]]:
     """Split blocks into batches that fit Slack's size limits.
 
-    Defaults: 40 blocks and 12,000 JSON characters per batch. Section and
-    header text longer than 3,000 characters is chunked first.
+    Defaults: 40 blocks and 12,000 JSON characters per batch. Section text
+    longer than 3,000 characters is chunked first. Header text longer than
+    150 characters becomes a bold section, because that is Slack's header
+    limit. A ``container`` is split into more containers with the same
+    settings, at most 10 children each, titled ``"{title} (continued)"``.
     """
     options = options or {}
     max_blocks = options.get("max_blocks", options.get("maxBlocks", DEFAULT_MAX_BLOCKS))
@@ -45,6 +53,8 @@ def split_blocks(
             normalized.extend(_split_section_block(block, DEFAULT_MAX_TEXT_SECTION_CHARACTERS))
         elif block.get("type") == "header":
             normalized.extend(_split_header_block(block, DEFAULT_MAX_TEXT_SECTION_CHARACTERS))
+        elif block.get("type") == "container":
+            normalized.extend(_split_container_block(block, max_chars))
         else:
             normalized.append(block)
 
@@ -162,6 +172,8 @@ def _split_preformatted_element(element: dict[str, Any], max_chars: int) -> list
         }
         if element.get("border") is not None:
             created["border"] = element["border"]
+        if element.get("language"):
+            created["language"] = element["language"]
         return created
 
     result: list[dict[str, Any]] = []
@@ -202,19 +214,94 @@ def _split_section_block(block: Block, max_chars: int) -> list[Block]:
 
 
 def _split_header_block(block: Block, max_chars: int) -> list[Block]:
-    if len(block["text"]["text"]) <= max_chars:
+    text = block["text"]["text"]
+    if len(text) <= SLACK_HEADER_MAX:
         return [block]
-    chunks = _chunk_string(block["text"]["text"], max_chars)
-    result: list[Block] = [
-        {
-            "type": "header",
-            "text": {**block["text"], "text": chunks[0]},
-            **({"block_id": block["block_id"]} if block.get("block_id") else {}),
-        }
+    return heading_text_to_sections(text, max_chars, block.get("block_id"))
+
+
+def _split_container_block(block: Block, max_chars: int) -> list[Block]:
+    children: list[Block] = []
+    for child in coerce_container_children(list(block.get("child_blocks") or [])):
+        children.extend(_normalize_container_child(child, max_chars))
+    if not children:
+        return [_container_shell(block, [], continued=False)]
+    groups: list[list[Block]] = []
+    current: list[Block] = []
+    for child in children:
+        continued = bool(groups)
+        if current and (
+            len(current) >= 10
+            or len(js_stringify(_container_shell(block, [*current, child], continued=continued))) > max_chars
+        ):
+            groups.append(current)
+            current = [child]
+            continue
+        current.append(child)
+    if current:
+        groups.append(current)
+    return [
+        _container_shell(block, group, continued=index > 0) for index, group in enumerate(groups)
     ]
-    for chunk in chunks[1:]:
-        result.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
-    return result
+
+
+def _normalize_container_child(child: Block, max_chars: int) -> list[Block]:
+    kind = child.get("type")
+    if kind == "section":
+        return _split_section_block(child, DEFAULT_MAX_TEXT_SECTION_CHARACTERS)
+    if kind == "header":
+        return _split_header_block(child, DEFAULT_MAX_TEXT_SECTION_CHARACTERS)
+    if kind == "rich_text" and len(js_stringify(child)) > max_chars:
+        return _split_large_rich_text_block(child, max_chars)
+    if kind == "container":
+        return _split_container_block(child, max_chars)
+    return [child]
+
+
+def _container_shell(block: Block, children: list[Block], *, continued: bool) -> Block:
+    shell: Block = {key: value for key, value in block.items() if key not in {"child_blocks", "block_id"}}
+    shell["type"] = "container"
+    shell["child_blocks"] = children
+    if not continued and block.get("block_id"):
+        shell["block_id"] = block["block_id"]
+    if continued:
+        _apply_continuation_title(shell)
+    return shell
+
+
+def _apply_continuation_title(block: Block) -> None:
+    suffix = " (continued)"
+    title = block.get("title")
+    if isinstance(title, dict) and title.get("type") == "plain_text" and not block.get("rich_text_title"):
+        text = str(title.get("text") or "")
+        block["title"] = {**title, "text": _fit_plain_title(text, suffix)}
+        return
+    rich = block.get("rich_text_title")
+    if isinstance(rich, dict):
+        block["rich_text_title"] = _append_rich_text(rich, suffix)
+
+
+def _fit_plain_title(text: str, suffix: str) -> str:
+    if len(text) + len(suffix) <= SLACK_HEADER_MAX:
+        return text + suffix
+    keep = SLACK_HEADER_MAX - len(suffix)
+    return text[: max(keep, 0)] + suffix
+
+
+def _append_rich_text(block: dict[str, Any], suffix: str) -> dict[str, Any]:
+    cloned = json.loads(js_stringify(block))
+    elements = cloned.setdefault("elements", [])
+    if not elements or elements[0].get("type") != "rich_text_section":
+        elements.append(
+            {"type": "rich_text_section", "elements": [{"type": "text", "text": suffix}]}
+        )
+        return cloned
+    section = elements[0].setdefault("elements", [])
+    if section and section[-1].get("type") == "text" and not section[-1].get("style"):
+        section[-1]["text"] = str(section[-1].get("text") or "") + suffix
+    else:
+        section.append({"type": "text", "text": suffix})
+    return cloned
 
 
 def _chunk_string(value: str, limit: int) -> list[str]:
@@ -386,7 +473,7 @@ def _render_preformatted(element: dict[str, Any], options: Mapping[str, Any] | N
     text = "".join(
         _render_section_element(item, options) for item in element.get("elements") or []
     )
-    return _wrap_fenced_code(text)
+    return _wrap_fenced_code(text, element.get("language") or "")
 
 
 def _render_quote(element: dict[str, Any], options: Mapping[str, Any] | None) -> str:
@@ -505,9 +592,9 @@ def _wrap_inline_code(text: str) -> str:
     return f"{fence}{text}{fence}"
 
 
-def _wrap_fenced_code(text: str) -> str:
+def _wrap_fenced_code(text: str, language: str = "") -> str:
     fence = _backtick_fence(text, 3)
-    return f"{fence}\n{text}\n{fence}"
+    return f"{fence}{language}\n{text}\n{fence}"
 
 
 def _backtick_fence(text: str, minimum: int) -> str:
@@ -536,9 +623,21 @@ def _convert_mrkdwn_to_markdown(text: str, options: Mapping[str, Any] | None) ->
         if character == "`":
             closing = text.find("`", index + 1)
             if closing != -1:
-                result.append(_wrap_inline_code(text[index + 1 : closing]))
+                result.append(_wrap_inline_code(_unescape_mrkdwn(text[index + 1 : closing])))
                 index = closing + 1
                 continue
+        if text.startswith('&amp;', index):
+            result.append('&')
+            index += 5
+            continue
+        if text.startswith('&lt;', index):
+            result.append('<')
+            index += 4
+            continue
+        if text.startswith('&gt;', index):
+            result.append('>')
+            index += 4
+            continue
         if character == "<":
             closing = text.find(">", index + 1)
             if closing != -1:
@@ -556,6 +655,27 @@ def _convert_mrkdwn_to_markdown(text: str, options: Mapping[str, Any] | None) ->
         index += 1
     return "".join(result)
 
+
+
+
+def _unescape_mrkdwn(text: str) -> str:
+    """Decode mrkdwn entities one pass, so a doubled amp stays an entity."""
+    result: list[str] = []
+    index = 0
+    while index < len(text):
+        if text.startswith('&amp;', index):
+            result.append('&')
+            index += 5
+        elif text.startswith('&lt;', index):
+            result.append('<')
+            index += 4
+        elif text.startswith('&gt;', index):
+            result.append('>')
+            index += 4
+        else:
+            result.append(text[index])
+            index += 1
+    return "".join(result)
 
 def _convert_angle_token(token: str, options: Mapping[str, Any] | None) -> str:
     user = re.fullmatch(r"<@([A-Za-z0-9_.-]+)>", token)
@@ -575,6 +695,7 @@ def _convert_angle_token(token: str, options: Mapping[str, Any] | None) -> str:
     formatted = re.fullmatch(r"<([^|>]+)\|(.+)>", token)
     if formatted:
         url, label = formatted.group(1), formatted.group(2)
+        url = _unescape_mrkdwn(url)
         return f"[{_convert_mrkdwn_to_markdown(label, options)}](<{url}>)"
     auto = re.fullmatch(r"<([^>]+)>", token)
     if auto:
@@ -788,6 +909,14 @@ def blocks_to_plain_text(blocks: list[Block]) -> str:
                         cells.append(render_rich_text(cell))
                 lines.append(" | ".join(cells))
             return "\n".join(lines)
+        if kind == "container":
+            title = (block.get("title") or {}).get("text") or ""
+            if title:
+                return title
+            rich = block.get("rich_text_title")
+            if isinstance(rich, dict):
+                return render_rich_text(rich)
+            return ""
         return ""
 
     parts = []
