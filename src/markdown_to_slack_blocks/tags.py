@@ -13,6 +13,7 @@ they must be quoted and entities such as ``&`` are decoded.
 
 from __future__ import annotations
 
+import json
 import re
 import xml.parsers.expat as expat
 from collections.abc import Callable, Mapping
@@ -61,6 +62,112 @@ def register_xml_tag_handler(name: str, handler: XmlTagHandler | None) -> None:
 def clear_xml_tag_handlers() -> None:
     """Remove every process-wide XML tag handler."""
     _REGISTRY.clear()
+
+
+SLACK_BLOCKS_TAG = "slack-blocks"
+
+
+def slack_blocks_handler(tag: XmlTagContext) -> Block | list[Block]:
+    """Turn ``<slack-blocks>`` into the blocks described by its JSON body.
+
+    Register it as the handler for ``slack-blocks``. The body is either a
+    JSON list of Block Kit blocks, one block object, or a message object
+    ``{"text": "...", "blocks": [...]}``. ``text`` is not posted to Slack;
+    it is the Markdown fallback for a web UI (see ``slack_blocks_to_text``).
+    A ```json fence around the JSON is ignored. If the body is not that
+    JSON, it is converted as ordinary Markdown instead of being dropped.
+    """
+    parsed = _parse_slack_blocks_body(tag.body)
+    if parsed is None:
+        return tag.convert(tag.body.strip())
+    if parsed["blocks"]:
+        return parsed["blocks"]
+    if parsed["text"]:
+        return tag.convert(parsed["text"])
+    return []
+
+
+def slack_blocks_to_text(markdown: str) -> str:
+    """Replace ``<slack-blocks>`` so a Markdown web UI does not show raw JSON.
+
+    A message object's ``text`` field is inserted as Markdown. Without one,
+    the blocks are rendered with ``blocks_to_markdown``. A body that is not
+    JSON is kept as Markdown, tags removed. Fenced code is left unchanged.
+    """
+    if not markdown:
+        return markdown
+    prepared, replacements = extract_xml_tags(markdown, {SLACK_BLOCKS_TAG})
+    if not replacements:
+        return markdown
+    for placeholder, element in replacements.items():
+        prepared = prepared.replace(placeholder, _slack_blocks_fallback_markdown(element["body"]))
+    return prepared
+
+
+def _parse_slack_blocks_body(body: str) -> dict[str, Any] | None:
+    raw = _strip_wrapping_fence(body)
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, list):
+        blocks = _as_blocks(payload)
+        if blocks is None:
+            return None
+        return {"blocks": blocks, "text": None}
+    if not isinstance(payload, dict):
+        return None
+    if "blocks" in payload:
+        if not isinstance(payload["blocks"], list):
+            return None
+        blocks = _as_blocks(payload["blocks"])
+        if blocks is None:
+            return None
+        text = payload.get("text")
+        if text is not None and not isinstance(text, str):
+            return None
+        return {"blocks": blocks, "text": text}
+    if isinstance(payload.get("type"), str):
+        return {"blocks": [dict(payload)], "text": None}
+    if isinstance(payload.get("text"), str):
+        return {"blocks": [], "text": payload["text"]}
+    return None
+
+
+def _as_blocks(items: list[Any]) -> list[Block] | None:
+    blocks: list[Block] = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("type"), str):
+            return None
+        blocks.append(dict(item))
+    return blocks
+
+
+def _slack_blocks_fallback_markdown(body: str) -> str:
+    parsed = _parse_slack_blocks_body(body)
+    if parsed is None:
+        return body.strip()
+    if parsed["text"]:
+        return parsed["text"].strip()
+    if parsed["blocks"]:
+        from .splitter import blocks_to_markdown
+
+        return blocks_to_markdown(parsed["blocks"]).strip()
+    return ""
+
+
+def _strip_wrapping_fence(text: str) -> str:
+    lines = text.strip().splitlines()
+    if (
+        len(lines) >= 2
+        and lines[0].startswith("```")
+        and set(lines[-1].strip()) <= {"`"}
+        and len(lines[-1].strip()) >= 3
+    ):
+        return "\n".join(lines[1:-1]).strip()
+    return text.strip()
 
 
 def container_block(

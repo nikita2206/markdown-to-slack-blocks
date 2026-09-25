@@ -2,7 +2,7 @@
 
 Convert Markdown into Slack [Block Kit](https://api.slack.com/block-kit) JSON, and render blocks back to Markdown or plain text.
 
-This is a Python port of [udivankin/markdown-to-slack-blocks](https://github.com/udivankin/markdown-to-slack-blocks) v1.6.1 (MIT), released here as 1.1.0. It is aimed at the same job: take Markdown from people or from an LLM and post it to Slack without losing headings, lists, code, tables, or mentions.
+This is a Python port of [udivankin/markdown-to-slack-blocks](https://github.com/udivankin/markdown-to-slack-blocks) v1.6.1 (MIT), released here as 1.2.0. It is aimed at the same job: take Markdown from people or from an LLM and post it to Slack without losing headings, lists, code, tables, or mentions.
 
 ```bash
 pip install markdown-to-slack-blocks
@@ -115,6 +115,36 @@ The check failed because **disk** was full.
 ```
 
 Return one block, a list of blocks, or an empty list to drop the element. Return `None` to leave that occurrence as normal Markdown.
+
+### Arbitrary Slack blocks
+
+An agent can emit Block Kit JSON that this library does not know how to build. Register `slack_blocks_handler` for `<slack-blocks>`. The body is a JSON list of blocks, one block object, or `{"text": "...", "blocks": [...]}`. A fenced `json` block around the JSON is fine. The blocks are inserted as written, so Slack mrkdwn inside them is not escaped again.
+
+`text` is not sent to Slack. `slack_blocks_to_text` swaps each tag for that Markdown so a web UI can render it. If `text` is missing, the blocks are rendered back to Markdown. If the body is not JSON, both paths treat it as Markdown.
+
+```python
+from markdown_to_slack_blocks import (
+    markdown_to_blocks,
+    slack_blocks_handler,
+    slack_blocks_to_text,
+)
+
+web = slack_blocks_to_text(agent_markdown)
+blocks = markdown_to_blocks(agent_markdown, {
+    "xml_tag_handlers": {"slack-blocks": slack_blocks_handler},
+})
+```
+
+```xml
+<slack-blocks>
+{"text": "Deployed **api** to prod.", "blocks": [
+  {"type": "section", "text": {"type": "mrkdwn", "text": "Deployed *api* to prod."}},
+  {"type": "actions", "elements": [
+    {"type": "button", "text": {"type": "plain_text", "text": "Rollback"}, "action_id": "rollback"}
+  ]}
+]}
+</slack-blocks>
+```
 
 `register_xml_tag_handler("sources", sources)` installs a process-wide default. An `xml_tag_handlers` entry overrides it, and setting the name to `None` there turns the global handler off for that call. `clear_xml_tag_handlers()` removes the defaults.
 
