@@ -72,11 +72,11 @@ Mentiones and styles inside preformatted block are ignored: <@U12345>, <#C00001>
 
 Previously strike-wrapped lists were not supported.
 
-1. **Bold-wrapped list with nested list**
+2. **Bold-wrapped list with nested list**
 
 Previously Bold-wrapped lists were not supported.
 
-1. *Italic-wrapped list*
+3. *Italic-wrapped list*
 
 Previously Italic-wrapped lists were not supported.
 

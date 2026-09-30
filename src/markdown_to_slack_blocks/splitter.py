@@ -460,13 +460,17 @@ def _render_rich_text_section(section: dict[str, Any], options: Mapping[str, Any
 def _render_rich_text_list(lst: dict[str, Any], options: Mapping[str, Any] | None) -> str:
     indent_unit = "   " if lst.get("style") == "ordered" else "  "
     indent = indent_unit * int(lst.get("indent") or 0)
-    start = int(lst.get("offset") or 1)
+    # Slack numbers an ordered list from offset + 1.
+    start = int(lst.get("offset") or 0) + 1
     lines = []
     for index, item in enumerate(lst.get("elements") or []):
         marker = f"{start + index}. " if lst.get("style") == "ordered" else "- "
         content = _render_rich_text_section(item, options)
         lines.append(_indent_multiline(f"{indent}{marker}", content))
-    return "\n".join(lines)
+    markdown = "\n".join(lines)
+    if lst.get("border"):
+        return "\n".join(f"> {line}" for line in markdown.split("\n"))
+    return markdown
 
 
 def _render_preformatted(element: dict[str, Any], options: Mapping[str, Any] | None) -> str:
@@ -856,7 +860,7 @@ def blocks_to_plain_text(blocks: list[Block]) -> str:
             )
         if kind == "rich_text_list":
             lines = []
-            offset = int(element.get("offset") or 1)
+            offset = int(element.get("offset") or 0) + 1
             for index, item in enumerate(element.get("elements") or []):
                 marker = f"{offset + index}. " if element.get("style") == "ordered" else "- "
                 lines.append(

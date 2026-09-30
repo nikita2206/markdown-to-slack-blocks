@@ -2,7 +2,7 @@
 
 Convert Markdown into Slack [Block Kit](https://api.slack.com/block-kit) JSON, and render blocks back to Markdown or plain text.
 
-This is a Python port of [udivankin/markdown-to-slack-blocks](https://github.com/udivankin/markdown-to-slack-blocks) v1.6.1 (MIT), released here as 1.2.0. It is aimed at the same job: take Markdown from people or from an LLM and post it to Slack without losing headings, lists, code, tables, or mentions.
+This started as a Python port of [udivankin/markdown-to-slack-blocks](https://github.com/udivankin/markdown-to-slack-blocks) v1.6.1 (MIT), released here as 1.2.0. It is aimed at the same job: take Markdown from people or from an LLM and post it to Slack without losing headings, lists, code, tables, or mentions. Since 1.3.0 it also reads Slack mrkdwn links and labelled mentions, links bare URLs, and never drops text inside lists or quotes.
 
 ```bash
 pip install markdown-to-slack-blocks
@@ -31,17 +31,30 @@ This is a **bold** statement.
 | A paragraph that is only an image | `image` |
 | GFM tables | `data_table` (or legacy `table`) |
 
-Inline styles become Slack mrkdwn (`*bold*`, `_italic_`, `~strike~`, `` `code` ``) inside sections, and `rich_text` style objects otherwise. Links become `<url|label>`.
+Inline styles become Slack mrkdwn (`*bold*`, `_italic_`, `~strike~`, `` `code` ``) inside sections, and `rich_text` style objects otherwise. Every link becomes `<url|label>` in mrkdwn and a `link` element in `rich_text`.
 
 Section mrkdwn escapes `&`, `<`, and `>` as `&amp;`, `&lt;`, and `&gt;`, except for tokens this library emits (`<url|label>`, `<@U…>`, `<#C…>`, `<!…>`). `rich_text` text is left as written, because Slack does not parse mrkdwn there. A `header` block is plain text and is not escaped. A heading longer than 150 characters is emitted as a bold section instead, and that text is escaped.
 
-Slack-specific tokens are recognized in the text:
+Every `mrkdwn` text object the library builds has `"verbatim": true`. Without it Slack links text that looks like a domain on its own, such as `settings.py` or `.Values.site`, even inside code spans. Links therefore come only from the input.
 
-- `<@U…>`, `<#C…>`, `<!subteam^S…>`, `<!subteam^T…>`
-- `<!here>`, `<!channel>`, `<!everyone>`
-- `<!date^timestamp^format|fallback>`
-- `:emoji:` shortcodes
-- `#rrggbb` color swatches when color detection is on
+No text is dropped. A code block, quote, or table inside a list item splits the list around it, and text after it continues without a new marker. An ordered list keeps its numbers across the split, and a list that starts at `3.` starts at 3, using `offset`. A quote holds only text in Slack, so a list inside a quote becomes a `rich_text_list` with `"border": 1`, and nested quotes are merged into one.
+
+## What it accepts
+
+Input is Markdown, but LLM output often mixes in Slack mrkdwn. The same thing written either way produces the same blocks.
+
+| Input | Read as |
+| --- | --- |
+| `[label](url)`, `<url>`, `<url\|label>` | a link |
+| A bare URL with a scheme, such as `https://example.com/a` | a link. Trailing punctuation stays outside, and a closing `)` only counts when it is balanced. Text without a scheme, such as `example.com`, is not a link |
+| `<@U…>`, `<#C…>`, `<!subteam^S…>`, `<!subteam^T…>`, `<!here>`, `<!channel>`, `<!everyone>`, with or without a Slack `\|label` | a mention. The label is dropped |
+| `<!date^timestamp^format\|fallback>` | a `date` element |
+| `:emoji:` | an `emoji` element |
+| `#rrggbb` | a `color` element when color detection is on |
+
+Slack syntax inside code spans and fences stays literal. A `<url|label>` whose URL Markdown would refuse, such as `javascript:`, is left as text.
+
+`*text*` is Markdown italic. It is also Slack's bold, but the two cannot be told apart, so write `**text**` for bold.
 
 ## Options
 
@@ -202,7 +215,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The tests include the upstream fixture corpus (`tests/fixtures`) and check both directions against it.
+The tests include the upstream fixture corpus (`tests/fixtures`) and check both directions against it. The expected output differs from upstream only by `"verbatim": true` on sections and by `offset` on ordered lists that do not start at 1.
 
 ## License
 

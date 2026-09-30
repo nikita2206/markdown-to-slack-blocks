@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from markdown_it import MarkdownIt
+from markdown_it.common.utils import unescapeAll
+from markdown_it.rules_inline import StateInline
 
 from .tags import apply_xml_tag_replacements, extract_xml_tags, resolve_xml_tag_handlers
 from .validator import validate_options
@@ -15,18 +17,30 @@ Node = dict[str, Any]
 
 _INLINE_TYPES = {"text", "html", "emphasis", "strong", "delete", "inlineCode", "link", "image"}
 
+# Slack's own angle tokens may carry a label (`<@U123|name>`); it is dropped on output.
+_LABEL = r"(?:\|[^<>\n]*)?"
+
 # Same token order as the JavaScript scanner. ASCII so \w / \d match JS.
 _TOKEN_RE = re.compile(
-    r"(<!here>|<!channel>|<!everyone>)"
-    r"|(<@([A-Za-z0-9_.-]+)>)"
-    r"|(#[0-9a-fA-F]{6})"
-    r"|(<#([A-Za-z0-9_.-]+)>)"
-    r"|(<!subteam\^([A-Za-z0-9_.-]+)>)"
-    r"|(<!date\^([0-9]+)\^([^|]+)\|([^>]+)>)"
-    r"|(:([A-Za-z0-9_+-]+):)"
-    r"|(@([A-Za-z0-9_.-]+))"
-    r"|(#([A-Za-z0-9_.-]+))",
+    rf"<!(?P<broadcast>here|channel|everyone){_LABEL}>"
+    rf"|<@(?P<user>[A-Za-z0-9_.-]+){_LABEL}>"
+    r"|(?P<color>#[0-9a-fA-F]{6})"
+    rf"|<#(?P<channel>[A-Za-z0-9_.-]+){_LABEL}>"
+    rf"|<!subteam\^(?P<subteam>[A-Za-z0-9_.-]+){_LABEL}>"
+    r"|<!date\^(?P<date>[0-9]+)\^(?P<date_format>[^|]+)\|[^>]+>"
+    r"|:(?P<emoji>[A-Za-z0-9_+-]+):"
+    r"|@(?P<at_name>[A-Za-z0-9_.-]+)"
+    r"|#(?P<hash_name>[A-Za-z0-9_.-]+)",
 )
+_SLACK_TOKEN = re.compile(r"<(?:[@#]|!(?:here|channel|everyone|subteam\^|date\^))[^<>\n]*>")
+# `\|` is accepted too: table rows escape the pipe (see preprocess_markdown).
+_SLACK_LINK = re.compile(r"<(?P<url>[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>|\\]+)\\?\|(?P<label>[^<>\n]*)>")
+_SLACK_ANGLE = re.compile(f"{_SLACK_LINK.pattern}|{_SLACK_TOKEN.pattern}")
+_TABLE_DELIMITER = re.compile(r"[ \t]*\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*")
+_QUOTE_PREFIX = re.compile(r"(?:[ ]{0,3}>[ ]?)*")
+# Lines that end a GFM table without a blank line: a heading, list item, or thematic break.
+_BLOCK_START = re.compile(r"[ ]{0,3}(?:#{1,6}(?:[ \t]|$)|[-*+](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)|(?:[-*_][ \t]*){3,}$)")
+_TEXT_NODES = ("paragraph", "heading", "html")
 
 _HEADING_WRAPPED_LIST = re.compile(
     r"^(#{1,6})\s+(\*\*|\*|_|~)(\d+\.|\*|-|\+)(\s+)(.*?)\2$"
@@ -35,13 +49,6 @@ _WRAPPED_LIST = re.compile(r"^(\*\*|\*|_|~)(\d+\.|\*|-|\+)(\s+)(.*?)\1$")
 _TASK_ITEM = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+\[[ xX]\]\s?(.*)$")
 _FENCE_OPEN = re.compile(r"^(\s{0,3})(`{3,}|~{3,})")
 _NUMERIC = re.compile(r"^-?[0-9]+(\.[0-9]+)?$")
-_SLACK_MRKDWN_TOKEN = re.compile(
-    r"^(?:<!here>|<!channel>|<!everyone>"
-    r"|<@[A-Za-z0-9_.-]+>"
-    r"|<#[A-Za-z0-9_.-]+>"
-    r"|<!subteam\^[A-Za-z0-9_.-]+>"
-    r"|<!date\^[0-9]+\^[^|]+\|[^>]+>)$"
-)
 
 # Slack data_table limits: header counts as a row, and cell text is summed.
 DATA_TABLE_MIN_ROWS = 2
@@ -51,10 +58,44 @@ DATA_TABLE_MAX_CELL_CHARACTERS = 20_000
 EMPTY_DATA_TABLE_CELL = " "
 SLACK_HEADER_MAX = 150
 
+
+def _slack_angle(state: StateInline, silent: bool) -> bool:
+    """Read Slack's ``<url|label>`` links and ``<@U…>``-style tokens as written.
+
+    CommonMark reads them as text, HTML, or an email autolink, which escapes or mangles them.
+    """
+    if state.src[state.pos] != "<":
+        return False
+    token = _SLACK_TOKEN.match(state.src, state.pos)
+    text = unescapeAll(token.group(0)) if token else ""
+    if token and _TOKEN_RE.fullmatch(text):
+        if not silent:
+            state.pending += text
+        state.pos = token.end()
+        return True
+    link = _SLACK_LINK.match(state.src, state.pos)
+    if not link:
+        return False
+    url = state.md.normalizeLink(unescapeAll(link["url"]))
+    if not state.md.validateLink(url):
+        return False
+    if not silent:
+        state.push("link_open", "a", 1).attrs = {"href": url}
+        label = unescapeAll(link["label"]).strip()
+        state.push("text", "", 0).content = label or state.md.normalizeLinkText(url)
+        state.push("link_close", "a", -1)
+    state.pos = link.end()
+    return True
+
+
 _MD = MarkdownIt(
     "commonmark",
-    {"html": True, "strikethrough_single_tilde": True},
-).enable(["strikethrough", "table"])
+    {"html": True, "linkify": True, "strikethrough_single_tilde": True},
+).enable(["strikethrough", "table", "linkify"])
+_MD.inline.ruler.before("autolink", "slack_angle", _slack_angle)
+# Only URLs with a scheme become links. Fuzzy matching would link file names such as `settings.py`.
+_MD.linkify.set({"fuzzy_link": False, "fuzzy_email": False, "fuzzy_ip": False})
+_MD.linkify.add("//", None)
 
 
 def markdown_to_blocks(
@@ -117,17 +158,20 @@ def _named_map(mentions: Mapping[str, Any], *keys: str) -> Mapping[str, str]:
 
 
 def preprocess_markdown(markdown: str) -> str:
-    """Unwrap lists that are fully wrapped in emphasis, and strip task boxes."""
+    """Unwrap lists that are fully wrapped in emphasis, strip task boxes, and keep Slack links in table cells."""
     lines = markdown.split("\n")
     processed: list[str] = []
     in_fence = False
+    in_table = False
+    table_depth = 0
     fence_char = ""
     fence_len = 0
 
-    for line in lines:
+    for index, line in enumerate(lines):
         fence = _FENCE_OPEN.match(line)
         if not in_fence and fence:
             in_fence = True
+            in_table = False
             marker = fence.group(2)
             fence_char = marker[0]
             fence_len = len(marker)
@@ -138,6 +182,17 @@ def preprocess_markdown(markdown: str) -> str:
                 in_fence = False
             processed.append(line)
             continue
+
+        depth, body = _quote_depth(line)
+        if not body.strip() or (in_table and (depth != table_depth or _BLOCK_START.match(body))):
+            in_table = False
+        if not in_table and "|" in body and index + 1 < len(lines):
+            next_depth, delimiter = _quote_depth(lines[index + 1])
+            in_table = next_depth == depth and "|" in delimiter and _TABLE_DELIMITER.fullmatch(delimiter) is not None
+            table_depth = depth
+        if in_table:
+            # A table row splits cells on every unescaped `|`, including the one in `<url|label>`.
+            line = _SLACK_ANGLE.sub(lambda match: match.group(0).replace("|", "\\|"), line)
 
         trimmed = line.strip()
         heading_match = _HEADING_WRAPPED_LIST.match(trimmed)
@@ -162,6 +217,13 @@ def preprocess_markdown(markdown: str) -> str:
         processed.append(line)
 
     return "\n".join(processed)
+
+
+def _quote_depth(line: str) -> tuple[int, str]:
+    """How many ``>`` markers quote a line, and the line without them."""
+    match = _QUOTE_PREFIX.match(line)
+    end = match.end() if match else 0
+    return line[:end].count(">"), line[end:]
 
 
 def _attr(token: Any, name: str) -> str | None:
@@ -272,6 +334,7 @@ def _parse_table(tokens: list[Any], index: int) -> tuple[Node, int]:
 
 
 def _parse_list(tokens: list[Any], index: int) -> tuple[Node, int]:
+    start = int(_attr(tokens[index], "start") or 1)
     ordered = tokens[index].type == "ordered_list_open"
     close_type = "ordered_list_close" if ordered else "bullet_list_close"
     index += 1
@@ -292,7 +355,7 @@ def _parse_list(tokens: list[Any], index: int) -> tuple[Node, int]:
                     children.append(child)
         items.append({"type": "listItem", "children": children})
         index += 1
-    return {"type": "list", "ordered": ordered, "children": items}, index + 1
+    return {"type": "list", "ordered": ordered, "start": start, "children": items}, index + 1
 
 
 def _parse_container(tokens: list[Any], index: int, close_type: str) -> tuple[list[Node], int]:
@@ -321,9 +384,6 @@ def _parse_block(tokens: list[Any], index: int) -> tuple[Node | None, int]:
         )
     if kind == "paragraph_open":
         inline = tokens[index + 1]
-        raw = inline.content or ""
-        if raw.startswith("<!"):
-            return {"type": "html", "value": raw}, index + 3
         return (
             {"type": "paragraph", "children": _parse_inline(inline.children)},
             index + 3,
@@ -360,159 +420,207 @@ def _markdown_to_ast(markdown: str) -> list[Node]:
     return nodes
 
 
+class _BlockWriter:
+    """Collects blocks. Consecutive rich text elements share one ``rich_text`` block."""
+
+    def __init__(self) -> None:
+        self.blocks: list[Block] = []
+        self._elements: list[dict[str, Any]] = []
+
+    def element(self, element: dict[str, Any]) -> None:
+        self._elements.append(element)
+
+    def block(self, *blocks: Block) -> None:
+        self.flush()
+        self.blocks.extend(blocks)
+
+    def flush(self) -> None:
+        if self._elements:
+            self.blocks.append({"type": "rich_text", "elements": self._elements})
+            self._elements = []
+
+
 def _parse_markdown(markdown: str, options: Mapping[str, Any]) -> list[Block]:
-    blocks: list[Block] = []
-    current: list[dict[str, Any]] = []
-
-    def flush() -> None:
-        nonlocal current
-        if current:
-            blocks.append({"type": "rich_text", "elements": current})
-            current = []
-
+    out = _BlockWriter()
     for node in _markdown_to_ast(markdown):
-        kind = node["type"]
-        if kind == "heading":
-            flush()
-            blocks.extend(_heading_blocks(node, options))
-        elif kind == "paragraph":
-            children = node["children"]
-            if len(children) == 1 and children[0]["type"] == "image":
-                flush()
-                image = children[0]
-                blocks.append(
-                    {
-                        "type": "image",
-                        "image_url": image["url"],
-                        "alt_text": image["alt"] or "Image",
-                    }
-                )
-            elif _flag(options, "prefer_section_blocks", "preferSectionBlocks", default=True) is not False:
-                flush()
-                blocks.append(
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": _inlines_to_mrkdwn(children, options),
-                        },
-                    }
-                )
-            else:
-                current.append(
-                    {
-                        "type": "rich_text_section",
-                        "elements": _map_inlines(children, options),
-                    }
-                )
-        elif kind == "list":
-            for element in _process_list(node, 0, options):
-                current.append(element)
-            flush()
-        elif kind == "code":
-            element: dict[str, Any] = {
-                "type": "rich_text_preformatted",
-                "elements": [{"type": "text", "text": node["value"]}],
-            }
-            if node.get("language"):
-                element["language"] = node["language"]
-            current.append(element)
-            flush()
-        elif kind == "blockquote":
-            elements: list[dict[str, Any]] = []
-            for child in node["children"]:
-                if child["type"] != "paragraph":
+        _render_node(node, out, options)
+    out.flush()
+    return out.blocks
+
+
+def _render_node(node: Node, out: _BlockWriter, options: Mapping[str, Any]) -> None:
+    kind = node["type"]
+    if kind == "heading":
+        out.block(*_heading_blocks(node, options))
+    elif kind == "paragraph":
+        children = node["children"]
+        if len(children) == 1 and children[0]["type"] == "image":
+            image = children[0]
+            out.block({"type": "image", "image_url": image["url"], "alt_text": image["alt"] or "Image"})
+        elif _flag(options, "prefer_section_blocks", "preferSectionBlocks", default=True) is not False:
+            out.block(_mrkdwn_section(_inlines_to_mrkdwn(children, options)))
+        else:
+            out.element({"type": "rich_text_section", "elements": _map_inlines(children, options)})
+    elif kind == "list":
+        _render_list(node, out, options, indent=0, quoted=False)
+        out.flush()
+    elif kind == "code":
+        element: dict[str, Any] = {
+            "type": "rich_text_preformatted",
+            "elements": [{"type": "text", "text": node["value"]}],
+        }
+        if node.get("language"):
+            element["language"] = node["language"]
+        out.element(element)
+        out.flush()
+    elif kind == "blockquote":
+        _render_quote(node, out, options)
+        out.flush()
+    elif kind == "thematicBreak":
+        out.block({"type": "divider"})
+    elif kind == "table":
+        out.block(*_table_blocks(node, options))
+    elif kind == "html":
+        out.element({"type": "rich_text_section", "elements": _process_text(node["value"], {}, options)})
+
+
+def _render_list(
+    node: Node,
+    out: _BlockWriter,
+    options: Mapping[str, Any],
+    indent: int,
+    quoted: bool,
+) -> None:
+    """Render a list. Content other than text in an item, such as code, splits the list around it."""
+    style = "ordered" if node["ordered"] else "bullet"
+    entries: list[dict[str, Any]] = []
+    first = number = node["start"]
+
+    def flush_entries() -> None:
+        nonlocal entries
+        if not entries:
+            return
+        element: dict[str, Any] = {"type": "rich_text_list", "style": style, "indent": indent, "elements": entries}
+        if style == "ordered" and first > 1:
+            # Slack numbers from offset + 1, so a list split around other content keeps counting.
+            element["offset"] = first - 1
+        if quoted:
+            element["border"] = 1
+        out.element(element)
+        entries = []
+
+    for item in node["children"]:
+        listed = False
+        for run in _text_runs(item["children"]):
+            if isinstance(run, list):
+                elements = _join_lines(_text_node_elements(child, options) for child in run)
+                if not elements:
                     continue
-                elements.extend(_map_inlines(child["children"], options))
-            current.append({"type": "rich_text_quote", "elements": elements})
-            flush()
-        elif kind == "thematicBreak":
-            flush()
-            blocks.append({"type": "divider"})
-        elif kind == "image":
-            flush()
-            blocks.append(
-                {
-                    "type": "image",
-                    "image_url": node["url"],
-                    "alt_text": node.get("alt") or "Image",
-                }
-            )
-        elif kind == "table":
-            flush()
-            cell_elements = [
-                [_map_inlines(cell["children"], options) for cell in row["children"]]
-                for row in node["children"]
-            ]
-            if _flag(options, "table_block_type", "tableBlockType") == "table":
-                rows = [
-                    [
-                        {
-                            "type": "rich_text",
-                            "elements": [{"type": "rich_text_section", "elements": elements}],
-                        }
-                        for elements in row
-                    ]
-                    for row in cell_elements
-                ]
-                blocks.append({"type": "table", "rows": rows})
+                if listed:
+                    # Text after a code block or nested list continues the item without a new marker.
+                    flush_entries()
+                    out.element(_text_element(elements, quoted))
+                else:
+                    if not entries:
+                        first = number
+                    entries.append({"type": "rich_text_section", "elements": elements})
+            elif run["type"] == "list":
+                flush_entries()
+                _render_list(run, out, options, indent + 1, quoted)
             else:
-                rows = [[_build_data_table_cell(elements) for elements in row] for row in cell_elements]
-                caption = _flag(options, "table_caption", "tableCaption", default="Data table")
-                blocks.extend(expand_data_table(rows, caption if caption else None))
-        elif kind == "html":
-            current.append(
+                flush_entries()
+                _render_node(run, out, options)
+            listed = True
+        number += 1
+    flush_entries()
+
+
+def _render_quote(node: Node, out: _BlockWriter, options: Mapping[str, Any]) -> None:
+    """Render a quote. A Slack quote holds only text, so a quoted list gets a quote border instead."""
+    for run in _text_runs(_quote_children(node)):
+        if isinstance(run, list):
+            elements = _join_lines(_text_node_elements(child, options) for child in run)
+            if elements:
+                out.element(_text_element(elements, quoted=True))
+        elif run["type"] == "list":
+            _render_list(run, out, options, indent=0, quoted=True)
+        else:
+            _render_node(run, out, options)
+
+
+def _quote_children(node: Node) -> list[Node]:
+    """A quote's children with nested quotes flattened, because Slack cannot nest quotes."""
+    children: list[Node] = []
+    for child in node["children"]:
+        if child["type"] == "blockquote":
+            children.extend(_quote_children(child))
+        else:
+            children.append(child)
+    return children
+
+
+def _text_runs(children: list[Node]) -> list[list[Node] | Node]:
+    """Group consecutive paragraphs, headings, and HTML; every other node stands alone."""
+    runs: list[list[Node] | Node] = []
+    for child in children:
+        if child["type"] not in _TEXT_NODES:
+            runs.append(child)
+        elif runs and isinstance(runs[-1], list):
+            runs[-1].append(child)
+        else:
+            runs.append([child])
+    return runs
+
+
+def _text_node_elements(node: Node, options: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if node["type"] == "paragraph":
+        return _map_inlines(node["children"], options)
+    if node["type"] == "heading":
+        return _flatten_styles(node["children"], {"bold": True}, options)
+    return _process_text(node["value"], {}, options)
+
+
+def _join_lines(parts: Iterable[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Join the paragraphs of one list item or quote with line breaks."""
+    joined: list[dict[str, Any]] = []
+    for part in parts:
+        if not part:
+            continue
+        if joined:
+            joined.append({"type": "text", "text": "\n"})
+        joined.extend(part)
+    return joined
+
+
+def _text_element(elements: list[dict[str, Any]], quoted: bool) -> dict[str, Any]:
+    return {"type": "rich_text_quote" if quoted else "rich_text_section", "elements": elements}
+
+
+def _table_blocks(node: Node, options: Mapping[str, Any]) -> list[Block]:
+    cell_elements = [
+        [_map_inlines(cell["children"], options) for cell in row["children"]]
+        for row in node["children"]
+    ]
+    if _flag(options, "table_block_type", "tableBlockType") == "table":
+        rows = [
+            [
                 {
-                    "type": "rich_text_section",
-                    "elements": _process_text(node["value"], {}, options),
+                    "type": "rich_text",
+                    "elements": [{"type": "rich_text_section", "elements": elements}],
                 }
-            )
+                for elements in row
+            ]
+            for row in cell_elements
+        ]
+        return [{"type": "table", "rows": rows}]
+    rows = [[_build_data_table_cell(elements) for elements in row] for row in cell_elements]
+    caption = _flag(options, "table_caption", "tableCaption", default="Data table")
+    return expand_data_table(rows, caption if caption else None)
 
-    flush()
-    return blocks
 
-
-def _process_list(list_node: Node, indent: int, options: Mapping[str, Any]) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    current_items: list[dict[str, Any]] = []
-    style = "ordered" if list_node["ordered"] else "bullet"
-
-    for item in list_node["children"]:
-        paragraph_elements: list[dict[str, Any]] = []
-        for child in item["children"]:
-            if child["type"] != "paragraph":
-                continue
-            paragraph_elements.extend(_map_inlines(child["children"], options))
-        if paragraph_elements:
-            current_items.append(
-                {"type": "rich_text_section", "elements": paragraph_elements}
-            )
-
-        nested = [child for child in item["children"] if child["type"] == "list"]
-        if nested:
-            if current_items:
-                results.append(
-                    {
-                        "type": "rich_text_list",
-                        "style": style,
-                        "indent": indent,
-                        "elements": current_items,
-                    }
-                )
-                current_items = []
-            for nested_list in nested:
-                results.extend(_process_list(nested_list, indent + 1, options))
-
-    if current_items:
-        results.append(
-            {
-                "type": "rich_text_list",
-                "style": style,
-                "indent": indent,
-                "elements": current_items,
-            }
-        )
-    return results
+def _mrkdwn_section(text: str) -> Block:
+    # verbatim: otherwise Slack links text such as `settings.py` on its own, even inside code spans.
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text, "verbatim": True}}
 
 
 def _heading_blocks(node: Node, options: Mapping[str, Any]) -> list[Block]:
@@ -521,15 +629,7 @@ def _heading_blocks(node: Node, options: Mapping[str, Any]) -> list[Block]:
     if node["depth"] <= 2 and len(text) <= SLACK_HEADER_MAX:
         return [{"type": "header", "text": {"type": "plain_text", "text": text}}]
     if prefer_section:
-        return [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*{_inlines_to_mrkdwn(node['children'], options)}*",
-                },
-            }
-        ]
+        return [_mrkdwn_section(f"*{_inlines_to_mrkdwn(node['children'], options)}*")]
     return [
         {
             "type": "rich_text",
@@ -554,10 +654,7 @@ def heading_text_to_sections(text: str, max_chars: int, block_id: str | None = N
     chunks = _chunk_heading(text, inner_limit)
     blocks: list[Block] = []
     for index, chunk in enumerate(chunks):
-        block: Block = {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*{escape_mrkdwn(chunk)}*"},
-        }
+        block = _mrkdwn_section(f"*{escape_mrkdwn(chunk)}*")
         if index == 0 and block_id:
             block["block_id"] = block_id
         blocks.append(block)
@@ -812,47 +909,40 @@ def _process_text(
         if match.start() > last:
             add_text(text[last : match.start()])
         full = match.group(0)
-        if match.group(1):
-            elements.append(
-                _with_style(
-                    {"type": "broadcast", "range": match.group(1)[2:-1]},
-                    style,
-                )
-            )
-        elif match.group(3):
-            elements.append(_with_style({"type": "user", "user_id": match.group(3)}, style))
-        elif match.group(4):
+        if match["broadcast"]:
+            elements.append(_with_style({"type": "broadcast", "range": match["broadcast"]}, style))
+        elif match["user"]:
+            elements.append(_with_style({"type": "user", "user_id": match["user"]}, style))
+        elif match["color"]:
             if detect_colors:
-                elements.append(_with_style({"type": "color", "value": match.group(4)}, style))
+                elements.append(_with_style({"type": "color", "value": match["color"]}, style))
             else:
                 add_text(full)
-        elif match.group(6):
-            elements.append(
-                _with_style({"type": "channel", "channel_id": match.group(6)}, style)
-            )
-        elif match.group(8):
-            subteam_id = match.group(8)
+        elif match["channel"]:
+            elements.append(_with_style({"type": "channel", "channel_id": match["channel"]}, style))
+        elif match["subteam"]:
+            subteam_id = match["subteam"]
             if subteam_id.startswith("S"):
                 elements.append(
                     _with_style({"type": "usergroup", "usergroup_id": subteam_id}, style)
                 )
             else:
                 elements.append(_with_style({"type": "team", "team_id": subteam_id}, style))
-        elif match.group(10):
+        elif match["date"]:
             elements.append(
                 _with_style(
                     {
                         "type": "date",
-                        "timestamp": int(match.group(10)),
-                        "format": match.group(11),
+                        "timestamp": int(match["date"]),
+                        "format": match["date_format"],
                     },
                     style,
                 )
             )
-        elif match.group(14):
-            elements.append(_with_style({"type": "emoji", "name": match.group(14)}, style))
-        elif match.group(16):
-            name = match.group(16)
+        elif match["emoji"]:
+            elements.append(_with_style({"type": "emoji", "name": match["emoji"]}, style))
+        elif match["at_name"]:
+            name = match["at_name"]
             if name in ("here", "channel", "everyone"):
                 elements.append(_with_style({"type": "broadcast", "range": name}, style))
             elif name in users:
@@ -868,8 +958,8 @@ def _process_text(
                 elements.append(_with_style({"type": "team", "team_id": teams[name]}, style))
             else:
                 add_text(full)
-        elif match.group(18):
-            name = match.group(18)
+        elif match["hash_name"]:
+            name = match["hash_name"]
             if name in channels:
                 elements.append(
                     _with_style({"type": "channel", "channel_id": channels[name]}, style)
@@ -903,9 +993,9 @@ def _inline_to_mrkdwn(node: Node, options: Mapping[str, Any]) -> str:
     if kind == "text":
         return _text_to_mrkdwn(node["value"], options)
     if kind == "html":
-        if _SLACK_MRKDWN_TOKEN.fullmatch(node["value"]):
-            return node["value"]
-        return escape_mrkdwn(node["value"])
+        match = _TOKEN_RE.fullmatch(node["value"])
+        canonical = _canonical_token(match) if match else None
+        return canonical if canonical is not None else escape_mrkdwn(node["value"])
     if kind == "emphasis":
         return f"_{_inlines_to_mrkdwn(node['children'], options)}_"
     if kind == "strong":
@@ -935,10 +1025,13 @@ def _text_to_mrkdwn(text: str, options: Mapping[str, Any]) -> str:
         if match.start() > last:
             result.append(escape_mrkdwn(text[last : match.start()]))
         full = match.group(0)
-        if match.group(1) or match.group(3) or match.group(4) or match.group(6) or match.group(8) or match.group(10) or match.group(14):
+        canonical = _canonical_token(match)
+        if canonical is not None:
+            result.append(canonical)
+        elif match["color"] or match["emoji"]:
             result.append(full)
-        elif match.group(16):
-            name = match.group(16)
+        elif match["at_name"]:
+            name = match["at_name"]
             if name in ("here", "channel", "everyone"):
                 result.append(f"<!{name}>")
             elif name in users:
@@ -949,15 +1042,28 @@ def _text_to_mrkdwn(text: str, options: Mapping[str, Any]) -> str:
                 result.append(f"<!subteam^{teams[name]}>")
             else:
                 result.append(escape_mrkdwn(full))
-        elif match.group(18):
-            name = match.group(18)
+        else:
+            name = match["hash_name"]
             if name in channels:
                 result.append(f"<#{channels[name]}>")
             else:
                 result.append(escape_mrkdwn(full))
-        else:
-            result.append(escape_mrkdwn(full))
         last = match.end()
     if last < len(text):
         result.append(escape_mrkdwn(text[last:]))
     return "".join(result)
+
+
+def _canonical_token(match: re.Match[str]) -> str | None:
+    """Slack's form of an angle token such as ``<@U123|name>``, without the label."""
+    if match["broadcast"]:
+        return f"<!{match['broadcast']}>"
+    if match["user"]:
+        return f"<@{match['user']}>"
+    if match["channel"]:
+        return f"<#{match['channel']}>"
+    if match["subteam"]:
+        return f"<!subteam^{match['subteam']}>"
+    if match["date"]:
+        return match.group(0)
+    return None

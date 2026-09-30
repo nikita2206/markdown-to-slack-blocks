@@ -73,7 +73,7 @@ def test_invalid_json_falls_back_to_markdown():
     source = "<slack-blocks>\nnot json, just **bold** and 2 < 5\n</slack-blocks>\n"
     blocks = markdown_to_blocks(source, OPTS)
     assert blocks == [
-        {"type": "section", "text": {"type": "mrkdwn", "text": "not json, just *bold* and 2 &lt; 5"}}
+        {"type": "section", "text": {"type": "mrkdwn", "text": "not json, just *bold* and 2 &lt; 5", "verbatim": True}}
     ]
     web = slack_blocks_to_text(source)
     assert "<slack-blocks>" not in web
