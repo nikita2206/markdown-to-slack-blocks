@@ -17,21 +17,24 @@
     "type": "section",
     "text": {
       "type": "mrkdwn",
-      "text": "*Heading 3*"
+      "text": "*Heading 3*",
+      "verbatim": true
     }
   },
   {
     "type": "section",
     "text": {
       "type": "mrkdwn",
-      "text": "This is a simple paragraph without any formatting."
+      "text": "This is a simple paragraph without any formatting.",
+      "verbatim": true
     }
   },
   {
     "type": "section",
     "text": {
       "type": "mrkdwn",
-      "text": "This is a paragraph with *bold*, _italic_, ~strike~, `code`, and <https://example.com|link>."
+      "text": "This is a paragraph with *bold*, _italic_, ~strike~, `code`, and <https://example.com|link>.",
+      "verbatim": true
     }
   },
   {
@@ -127,7 +130,8 @@
     "type": "section",
     "text": {
       "type": "mrkdwn",
-      "text": "This is a paragraph with text styles: *bold*, _italic_, ~strike~, `code`. And with non-formatted mentions: <@U12345>, <!here>, <!subteam^S12345>, #general. And with formatted mentions: <@U12345>, <#C00001>, <@S12345>, <@here>, <@T123456>.\nMentiones and styles inside code block are ignored: `&lt;@U12345&gt;, &lt;#C00001&gt;, &lt;@S12345&gt;, &lt;@here&gt;, &lt;@T123456&gt;, @jdoe, @here, @devs, #general, **bold**, *italic*, ~strike~ `"
+      "text": "This is a paragraph with text styles: *bold*, _italic_, ~strike~, `code`. And with non-formatted mentions: <@U12345>, <!here>, <!subteam^S12345>, #general. And with formatted mentions: <@U12345>, <#C00001>, <@S12345>, <@here>, <@T123456>.\nMentiones and styles inside code block are ignored: `&lt;@U12345&gt;, &lt;#C00001&gt;, &lt;@S12345&gt;, &lt;@here&gt;, &lt;@T123456&gt;, @jdoe, @here, @devs, #general, **bold**, *italic*, ~strike~ `",
+      "verbatim": true
     }
   },
   {
@@ -674,7 +678,8 @@
     "type": "section",
     "text": {
       "type": "mrkdwn",
-      "text": "Previously strike-wrapped lists were not supported."
+      "text": "Previously strike-wrapped lists were not supported.",
+      "verbatim": true
     }
   },
   {
@@ -697,7 +702,8 @@
               }
             ]
           }
-        ]
+        ],
+        "offset": 1
       }
     ]
   },
@@ -705,7 +711,8 @@
     "type": "section",
     "text": {
       "type": "mrkdwn",
-      "text": "Previously Bold-wrapped lists were not supported."
+      "text": "Previously Bold-wrapped lists were not supported.",
+      "verbatim": true
     }
   },
   {
@@ -728,7 +735,8 @@
               }
             ]
           }
-        ]
+        ],
+        "offset": 2
       }
     ]
   },
@@ -736,7 +744,8 @@
     "type": "section",
     "text": {
       "type": "mrkdwn",
-      "text": "Previously Italic-wrapped lists were not supported."
+      "text": "Previously Italic-wrapped lists were not supported.",
+      "verbatim": true
     }
   },
   {
@@ -764,7 +773,8 @@
     "type": "section",
     "text": {
       "type": "mrkdwn",
-      "text": "Previously strike-wrapped unordered lists were not supported."
+      "text": "Previously strike-wrapped unordered lists were not supported.",
+      "verbatim": true
     }
   },
   {

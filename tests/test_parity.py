@@ -27,7 +27,7 @@ def options(prefer_section_blocks=None):
 
 def test_plain_text_section_by_default():
     assert markdown_to_blocks("Hello world") == [
-        {"type": "section", "text": {"type": "mrkdwn", "text": "Hello world"}}
+        {"type": "section", "text": {"type": "mrkdwn", "text": "Hello world", "verbatim": True}}
     ]
 
 
