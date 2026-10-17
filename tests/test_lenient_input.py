@@ -175,3 +175,29 @@ def test_quotes_keep_every_paragraph_list_and_code_block():
         },
         {"type": "rich_text_preformatted", "elements": [{"type": "text", "text": "code"}]},
     ]
+
+
+@pytest.mark.parametrize(
+    ("markdown", "emoji"),
+    [
+        ("- at 21:50:05", []),
+        ("| Time |\n| --- |\n| **21:50:05** |", []),
+        ("- x:smile:y", []),
+        ("- :50: and (:smile:), done :white_check_mark:.", ["50", "smile", "white_check_mark"]),
+    ],
+)
+def test_emoji_only_when_no_letter_or_digit_touches_the_colons(markdown, emoji):
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("type") == "emoji":
+                found.append(node["name"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(markdown_to_blocks(markdown))
+    assert found == emoji

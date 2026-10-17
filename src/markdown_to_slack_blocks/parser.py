@@ -28,7 +28,8 @@ _TOKEN_RE = re.compile(
     rf"|<#(?P<channel>[A-Za-z0-9_.-]+){_LABEL}>"
     rf"|<!subteam\^(?P<subteam>[A-Za-z0-9_.-]+){_LABEL}>"
     r"|<!date\^(?P<date>[0-9]+)\^(?P<date_format>[^|]+)\|[^>]+>"
-    r"|:(?P<emoji>[A-Za-z0-9_+-]+):"
+    # Not touching a letter or digit, so a time such as 21:50:05 does not become the `50` emoji.
+    r"|(?<![A-Za-z0-9]):(?P<emoji>[A-Za-z0-9_+-]+):(?![A-Za-z0-9])"
     r"|@(?P<at_name>[A-Za-z0-9_.-]+)"
     r"|#(?P<hash_name>[A-Za-z0-9_.-]+)",
 )
