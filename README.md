@@ -49,7 +49,7 @@ Input is Markdown, but LLM output often mixes in Slack mrkdwn. The same thing wr
 | A bare URL with a scheme, such as `https://example.com/a` | a link. Trailing punctuation stays outside, and a closing `)` only counts when it is balanced. Text without a scheme, such as `example.com`, is not a link |
 | `<@U…>`, `<#C…>`, `<!subteam^S…>`, `<!subteam^T…>`, `<!here>`, `<!channel>`, `<!everyone>`, with or without a Slack `\|label` | a mention. The label is dropped |
 | `<!date^timestamp^format\|fallback>` | a `date` element |
-| `:emoji:` | an `emoji` element |
+| `:emoji:` | an `emoji` element, unless a letter or digit touches either colon, so a time such as `21:50:05` stays text |
 | `#rrggbb` | a `color` element when color detection is on |
 
 Slack syntax inside code spans and fences stays literal. A `<url|label>` whose URL Markdown would refuse, such as `javascript:`, is left as text.
