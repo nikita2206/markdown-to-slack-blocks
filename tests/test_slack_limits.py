@@ -130,3 +130,15 @@ def test_split_container_caps_children_and_continues_the_title():
     texts = [child["text"]["text"] for child in packed[0]["child_blocks"]]
     assert all(len(text) <= 3000 for text in texts)
     assert "".join(texts).replace(" ", "") == long_text.replace(" ", "")
+
+
+def test_data_table_header_cells_are_plain_text():
+    """Slack rejects rich_text header cells with data_table_header_cells_must_not_be_rich_text."""
+    [table] = markdown_to_blocks("| **Host** | `state` | [Docs](https://x.test) |\n| --- | --- | --- |\n| **a** | down | b |")
+    assert table["type"] == "data_table"
+    assert table["rows"][0] == [
+        {"type": "raw_text", "text": "Host"},
+        {"type": "raw_text", "text": "state"},
+        {"type": "raw_text", "text": "Docs"},
+    ]
+    assert table["rows"][1][0]["type"] == "rich_text"
