@@ -774,10 +774,26 @@ def expand_data_table(rows: list[list[dict[str, Any]]], caption: str | None = No
 
 
 def _data_table_block(rows: list[list[dict[str, Any]]], caption: str | None) -> Block:
-    block: Block = {"type": "data_table", "rows": rows}
+    header, *body = rows
+    block: Block = {"type": "data_table", "rows": [[_header_cell(cell) for cell in header], *body]}
     if caption:
         block["caption"] = caption
     return block
+
+
+def _header_cell(cell: dict[str, Any]) -> dict[str, Any]:
+    """Slack rejects a ``rich_text`` header cell (``data_table_header_cells_must_not_be_rich_text``), so styles go."""
+    if cell.get("type") != "rich_text":
+        return cell
+    parts: list[str] = []
+    for element in cell.get("elements") or []:
+        for item in element.get("elements") or []:
+            kind = item.get("type")
+            if kind in ("text", "link"):
+                parts.append(item.get("text") or item.get("url") or "")
+            elif kind == "emoji":
+                parts.append(f":{item.get('name')}:")
+    return {"type": "raw_text", "text": "".join(parts) or EMPTY_DATA_TABLE_CELL}
 
 
 def _legacy_table(rows: list[list[dict[str, Any]]]) -> Block:
